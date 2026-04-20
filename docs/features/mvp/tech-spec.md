@@ -1,6 +1,6 @@
 # Scaffold Tech Spec
 
-_Design document: [`docs/scaffold-design.md`](../../scaffold-design.md)_
+_Design document: [`prd.md`](prd.md)_
 
 ## Overview
 

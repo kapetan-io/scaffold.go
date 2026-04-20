@@ -6,6 +6,24 @@ Scaffold is a Go framework for building HTTP API services. It provides service l
 
 The name "scaffold" reflects its role: it provides the structural shell around your service so you focus on business logic.
 
+## Problem
+
+Teams building DUH-RPC services in Go currently hand-roll the same scaffolding for every new service: process lifecycle, signal handling, port binding, middleware registration, graceful shutdown ordering, config loading, health and readiness endpoints, and test harnesses that exercise the full stack without hitting production ports. The result is drift — two services in the same company end up with subtly different shutdown ordering, different middleware layering, different test ergonomics — and every new service spends weeks reaching parity with the rest of the fleet before it writes a line of business logic.
+
+The cost is concentrated in two places. First, incidents frequently trace back to lifecycle bugs — connections not drained, cleanup skipped, readiness reported before the service is actually ready — that each team has to rediscover. Second, platform teams trying to enforce company-wide standards (request IDs, structured auth, standard metrics) have no stable seam to hook into, so standards are copy-pasted into each service and drift.
+
+Scaffold exists to move this work out of service code and into a shared framework with a small, explicit surface area.
+
+## Audience
+
+Scaffold serves three roles:
+
+- **Service author** — writes the `Daemon` implementation. Wants minimal boilerplate between `main()` and business logic, and a test story that exercises the full middleware stack against fake dependencies.
+- **Platform / infrastructure team** — builds a company wrapper on top of scaffold to enforce standards (auth, metrics, request IDs, TLS, binding conventions) without forking the framework. Wants a stable, plain-struct seam for composition.
+- **Operator** — runs the resulting service in production. Wants predictable startup, graceful shutdown that respects a single timeout budget, and observable failure modes via health, readiness, and binding-exit logs.
+
+Naming these roles explains several design calls below — why `DaemonConfig` is a plain exported struct, why `Bindings.Get` exists, why a binding's unexpected exit does not tear down the daemon. Scaffold does not commit to solving every pain each role has; the scope boundaries stated inline throughout the document define what is and is not in v1.
+
 ## Mental Model
 
 Scaffold is organized around five concepts:
@@ -442,7 +460,7 @@ func NewServer(svc Service) *Server
 
 ## Configuration
 
-Environment variable based (12-factor) by default. CLI arguments take precedence over environment variables. Accessed via `sc.Config` during `OnStart`.
+Environment variable based (12-factor) by default. Accessed via `sc.Config` during `OnStart`.
 
 ```go
 type ConfigProvider interface {
@@ -669,6 +687,8 @@ func (s *Server) handleTransferFunds(w http.ResponseWriter, r *http.Request) {
 ```
 
 ## Company Wrapper Pattern
+
+Supporting this pattern without requiring a scaffold fork is a v1 goal. The API choices that serve it — `DaemonConfig` as a plain exported struct passed as a pointer, and `Bindings.Get` returning previously-added bindings — exist for this reason and are load-bearing.
 
 Because `scaffold.DaemonConfig` is a plain exported struct passed as a pointer, organizations can build a company-standard base layer on top of scaffold without forking it.
 
