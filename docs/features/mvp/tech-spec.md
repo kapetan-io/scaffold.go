@@ -79,6 +79,8 @@ The `tackle` dependency is accepted (vs. copying code into `scaffold/autotls`) b
 
 `Start` (test entry point) uses the caller-supplied context for `OnStart`, and the context passed to `Instance.Stop(ctx)` for shutdown steps. `OnStartTimeout` / `OnStopTimeout` are ignored in test mode.
 
+`Start` accepts a nil `*Options`, which is treated as `&Options{}`; each zero-value field then resolves to its documented default (`TestBindings`, `EnvConfigProvider`, built-in color logger, no timeouts).
+
 Both the Start and Shutdown contexts are enriched with framework services (see below) before being handed to `OnStart` / `OnStop`. Enrichment always uses `context.WithValue` on top of whatever parent context is in play. The caller's cancellation and any deadline they attached to the Start context remain in effect.
 
 ### Context enrichment
@@ -163,6 +165,8 @@ All paths share the single `OnStopTimeout`-derived context (Serve) or the contex
 
 If any step in any path returns an error, scaffold logs it and continues to the next step. A failed `OnStop` never prevents `Cleaner.Clean` from running. A failed `http.Server.Shutdown` never prevents later bindings from shutting down or subsequent steps from running.
 
+Scaffold wraps each `OnStop` call and each `http.Server.Shutdown` call in its own `defer/recover`. A panic is logged at error level with the panic value and `debug.Stack()`, and the shutdown sequence continues to the next step. This preserves the core guarantee that `Cleaner.Clean` always runs — an unrecovered panic in `OnStop` would otherwise skip it. `Cleaner` already recovers per-function panics internally (see "Cleaner & Thread-Safety").
+
 ### Error surfacing
 
 `Start` and `Serve` have different return signatures and therefore different error-surfacing rules:
@@ -224,6 +228,8 @@ func (t *TestBindings) Add(name string, port int) *Binding     // ignores port, 
 
 Passing `0` to `net.Listen` yields a kernel-assigned ephemeral port.
 
+The public `Bindings` interface (`Add(name, port) *Binding`, `Get(name) *Binding`) is an extension point: `Options.Bindings` accepts any implementation. The two built-ins cover production and standard test use; third-party implementations are supported for cases such as a fully in-memory pipe-based binding that lets surface tests run under `testing/synctest`. Implementations must guarantee duplicate-name rejection and `Get`-after-`Add` consistency, which the built-in `bindingStore` provides.
+
 ### Listen addresses
 
 - `DefaultBindings` listens on `:<port>` (all interfaces, Go's standard convention).
@@ -279,6 +285,10 @@ func (i *Instance) Addr(name string) net.Addr
 ```
 
 Panics when `name` was never added; the panic message names the missing binding. For `ServeFunc` bindings, `addr` is set from the listener before the user's serve function is invoked.
+
+### `Instance.Stop`
+
+`Instance.Stop(ctx)` is idempotent. A `sync.Once`-backed guard runs the shutdown sequence exactly once; subsequent calls return nil immediately without re-running any step. This matches the Go convention for `Close`-shaped methods and lets tests safely combine `defer inst.Stop(ctx)` with an explicit earlier `Stop` in specific code paths.
 
 ## HTTP Server Wiring
 
@@ -485,7 +495,7 @@ After a successful `Hijack()` call, the wrapper stops treating the response as H
 
 ### `Cleaner`
 
-LIFO stack, concurrent-safe registration. Construction takes a `*slog.Logger` so that panic recovery and error reporting inside `Clean` have a non-nil target. Scaffold constructs the `Cleaner` when building `DaemonConfig`, passing `sc.Log`.
+LIFO stack, concurrent-safe registration. Construction takes a `*slog.Logger` so that panic recovery and error reporting inside `Clean` have a non-nil target. Scaffold constructs a `Cleaner` internally when building `DaemonConfig`, passing `sc.Log`. `NewCleaner` is exported so callers may construct additional instances outside the daemon lifecycle — a background subsystem that wants LIFO teardown, a CLI `Run()` function, or a test that exercises `Cleaner` in isolation.
 
 ```go
 type Cleaner struct {
@@ -495,8 +505,7 @@ type Cleaner struct {
     running bool
 }
 
-// Package-internal constructor; scaffold calls this when building DaemonConfig.
-func newCleaner(log *slog.Logger) *Cleaner
+func NewCleaner(log *slog.Logger) *Cleaner
 
 func (c *Cleaner) Add(fn func(context.Context) error)
 func (c *Cleaner) Clean(ctx context.Context) error
@@ -517,7 +526,7 @@ Behavior:
 
 ## Testing
 
-Testing follows the `surface-testing` skill.
+Testing follows the `surface-testing` skill. All tests live in `package scaffold_test` (and `package sprometheus_test` for the prometheus subpackage) — the underscore-test convention is mandatory. A test that cannot compile outside the internal package is a signal that it is reaching into internals and must be restructured to enter through the public surface.
 
 ### Key surfaces
 
@@ -526,7 +535,7 @@ Testing follows the `surface-testing` skill.
 - Lifecycle happy path (single binding, plain HTTP, round-trip, clean stop).
 - Multiple bindings — open in `Add` order, shut down in reverse.
 - `OnStart` returns error → `OnStop` called, no ports opened.
-- Second binding fails to open → `OnStop` called, first binding closed.
+- Second binding fails to open → `OnStop` called, first binding closed. Fault injected at the boundary: the test pre-binds the target port with its own `net.Listen` before starting the daemon, so scaffold's `net.Listen(":port")` returns `EADDRINUSE` through the real error path — no internal hooks. Uses `DefaultBindings` with a port reserved the same way (listen on `:0`, read the assigned port, keep the listener open).
 - `OnStartTimeout` cancellation honored.
 - Graceful drain — in-flight handler completes under the shutdown ctx deadline.
 - `PanicRecovery` — handler panics return `500 "internal server error"`, subsequent requests still served.
@@ -553,9 +562,9 @@ Testing follows the `surface-testing` skill.
 **Unit**:
 
 - Each `ConfigProvider` implementation (`Env`, `Map`, `File`) tested through its interface methods. `FileConfigProvider` tests use `t.TempDir()`. `MapConfigProvider` with nil `Values` verified: every lookup returns fallback / not-found.
-- `Cleaner` — LIFO order, panic-in-cleaner recovery, error-in-cleaner continuation.
+- `Cleaner` — LIFO order, panic-in-cleaner recovery, error-in-cleaner continuation, `Add`-after-`Clean` panic, double-`Clean` error. Constructed in tests via the exported `NewCleaner(log)`.
 - `HealthHandler` and `ReadyHandler` — via `httptest.NewRecorder` as plain `http.Handler`. Covers happy paths, 503 with reason body, marshal-failure path, and nil-log construction panic.
-- Port-readiness helper — happy path and timeout path, exercised indirectly via integration tests (bring up a daemon and assert the returned `Instance.Addr` responds) plus one targeted test on the unreachable-address timeout via an address that won't accept. Includes an unspecified-address case (`0.0.0.0`) to cover the loopback translation.
+- Port-readiness helper — happy path and the unspecified-address translation (`0.0.0.0` → `127.0.0.1`, `[::]` → `[::1]`) are covered implicitly by every integration test that uses `DefaultBindings` (which listens on `:<port>`) and then hits the returned `Instance.Addr`. The timeout branch is defensive code for sandbox/firewall misconfigurations that do not reproduce portably from a test; its error-formatting is verified by code review rather than a dedicated test. If a future bug surfaces in that branch, add a test-only dial-injection seam at that time — do not add one speculatively.
 
 ### Fakes needed
 
@@ -572,19 +581,6 @@ Must land before scaffold implementation begins:
 
 1. **`tackle/autotls` slog migration** — replace `StandardLogger` with `*slog.Logger`; replace `NoOpLogger` default with `slog.New(slog.DiscardHandler)`. Mechanical change — the existing interface is already slog-shaped.
 
-## Design-Doc Drift
+## Config Provider Errors
 
-The following spec decisions contradict the current design document. They are final for v1; the design document needs a separate revision pass.
-
-- **CLI args.** `Serve`'s `args []string` parameter is reserved/ignored in v1. Design doc claims CLI args take precedence over env config.
-- **autotls package.** Spec uses `github.com/kapetan-io/tackle/autotls` directly. Design doc shows a minimal `scaffold/autotls` package.
-- **RequestID middleware.** Dropped from v1 built-ins. Design doc examples use `scaffold.RequestID()`.
-- **Built-in logger.** Always colorized; no TTY detection. Design doc specifies TTY-detected color suppression.
-- **Start context parent.** Derived from the caller's ctx so cancellation propagates. Design doc (lifecycle section) says Start ctx is derived from `context.Background()`.
-- **MapConfigProvider shape.** Now a struct with `Values` and `Logger` fields. Design doc's composite-literal usage `MapConfigProvider{"K": "V"}` no longer compiles.
-- **HealthHandler signature.** Takes a `*slog.Logger` as its first argument so marshal-failure logging has a non-nil target. Design doc shows `HealthHandler(fn)` without a logger.
-- **`Serve` error surfacing.** All failures (`OnStart`, bind, shutdown steps) map to `ExitFailure`. No differentiated exit codes.
-
-## Remaining Open Questions
-
-- **Error sentinels.** Whether providers should export `scaffold.ErrKeyNotFound` (and possibly `ErrParseFailed`) for callers to use with `errors.Is`, or whether string-matching suffices. Not resolved; defer to implementation time if no caller surfaces a need.
+V1 ships plain string-formatted errors from every `ConfigProvider` implementation. No exported `ErrKeyNotFound` or `ErrParseFailed` sentinels. Adding sentinels later is backward compatible (a new exported var does not break string-matching callers); do so reactively when a concrete caller surfaces a need for `errors.Is`.
