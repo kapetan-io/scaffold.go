@@ -86,11 +86,14 @@ const (
 )
 ```
 
-- `Serve()` is called from `main()`. It blocks until it receives SIGTERM/SIGINT **or** the provided `ctx` is cancelled, then performs graceful shutdown and returns an exit code. Context cancellation is equivalent to receiving a signal — both trigger the same orderly shutdown path. `Serve()` owns all logging internally via the configured logger — the caller maps the exit code to `os.Exit` only. The context passed to `Serve()` is used **only** for cancellation (triggering shutdown). It is **not** passed to `OnStart` or `OnStop`. Instead, scaffold creates separate contexts for `OnStart` and `OnStop` derived from `context.Background()`, applying `OnStartTimeout` and `OnStopTimeout` deadlines respectively. If `OnStart` does not return before its deadline, the context is cancelled — `OnStart` must respect context cancellation and return promptly.
+- `Serve()` is called from `main()`. It blocks until it receives SIGTERM/SIGINT **or** the provided `ctx` is cancelled, then performs graceful shutdown and returns an exit code. Context cancellation is equivalent to receiving a signal — both trigger the same orderly shutdown path. `Serve()` owns all logging internally via the configured logger — the caller maps the exit code to `os.Exit` only. Scaffold derives two contexts from the caller's ctx passed to `Serve()`:
+    - The **Start context** — used for `OnStart` — is derived from the caller's ctx with `OnStartTimeout` applied (if non-zero). Caller cancellation propagates into `OnStart`, so a caller who cancels the ctx can interrupt a stalled `OnStart`.
+    - The **Shutdown context** — used for `http.Server.Shutdown`, `OnStop`, and `Cleaner.Clean` — is derived from `context.Background()` with `OnStopTimeout` applied (if non-zero). Caller cancellation does **not** shorten the shutdown budget.
 - `Start()` is called from tests. It uses `TestBindings` by default, binding each listener to a random port on `127.0.0.1`. It returns immediately with a `*Instance` once the service is fully initialized and serving. The context passed to `Start()` is passed directly to `OnStart` — `OnStartTimeout` and `OnStopTimeout` are ignored, giving the test full control over timeout behavior.
 - Both call `OnStart`/`OnStop` on the daemon. The only difference is signal handling, the default `Bindings` implementation, and the context model.
 - Both `Start()` and `Serve()` do not return until they verify all bound ports are open and accepting TCP connections. This avoids any race conditions which might occur between start and sending requests to the server.
-- `args []string` is passed for CLI argument support. CLI arguments take precedence over environment variable configuration. Reserved for future sub-command expansion (e.g. `my-service serve`).
+- `Serve()` exit code mapping: all failures (`OnStart` error, bind failure, `OnStop` error, `Cleaner.Clean` error) return `ExitFailure`. Clean shutdowns — signal-triggered or ctx-cancel triggered — return `ExitSuccess`. There is no third exit code in v1.
+- `args []string` is reserved on the `Serve` signature; it is not interpreted by scaffold in v1.
 
 ```go
 func main() {
@@ -121,9 +124,9 @@ type Options struct {
     ConfigProvider  ConfigProvider // nil → EnvConfigProvider
     SecretsProvider ConfigProvider // nil → EnvConfigProvider
     Log             *slog.Logger   // nil → built-in color logger writing to os.Stdout;
-                                   //        TTY-detected: color in a terminal, plain text otherwise.
-    OnStartTimeout  time.Duration  // zero → no timeout on the context passed to OnStart
-    OnStopTimeout   time.Duration  // zero → no timeout on the context passed to http.Server.Shutdown, OnStop, and Cleaner
+                                   //        always colorized, no timestamps.
+    OnStartTimeout  time.Duration  // zero → no deadline on the Start context (derived from the caller's ctx in Serve)
+    OnStopTimeout   time.Duration  // zero → no deadline on the Shutdown context (derived from context.Background() in Serve)
 }
 ```
 
@@ -149,8 +152,10 @@ For e2e tests that need specific ports, supply `DefaultBindings` and a `MapConfi
 inst, err := scaffold.Start(ctx, daemon, &scaffold.Options{
     Bindings: &scaffold.DefaultBindings{},
     ConfigProvider: scaffold.MapConfigProvider{
-        "API_PORT":   "8443",
-        "ADMIN_PORT": "9090",
+        Values: map[string]string{
+            "API_PORT":   "8443",
+            "ADMIN_PORT": "9090",
+        },
     },
 })
 ```
@@ -289,10 +294,14 @@ Middleware can cancel requests (don't call `next`), enrich the request context (
 
 Request body size limits are a middleware concern. Scaffold does not provide a body-size-limit middleware. For DUH-RPC services, the DUH spec enforces its own body size limits at the generated handler level. For non-DUH endpoints behind `SetMux`, the service author is responsible for applying their own body-limit middleware (e.g. wrapping `http.MaxBytesReader`).
 
+### Core middleware inventory
+
+Only `scaffold.PanicRecovery(log)` ships as a built-in middleware in v1. Everything else — request IDs, access logs, CORS, rate limiting, compression — is either written by the service author, pulled from a third-party package, or lifted into a company wrapper. The `scaffold/prometheus` subpackage provides `HTTPMetrics` separately so the core module stays free of the Prometheus client dependency (see Metrics).
+
 ### Middleware execution order
 
 ```
-Binding (UseMiddleware) → RequestID → PanicRecovery → RequireAuth
+Binding (UseMiddleware) → PanicRecovery → RequireAuth
                        → RPCHandler chain (AddRPC)
                        → SetMux fallback
                        → 404
@@ -334,15 +343,17 @@ The exception is transport-level access control on entire bindings — like admi
 Scaffold provides `HealthHandler` and `ReadyHandler` as plain `http.Handler` helpers. They are mounted by the service author into whatever mux is passed to `SetMux`. No special framework integration is required.
 
 ```go
-func HealthHandler(fn func(ctx context.Context) any) http.Handler
+func HealthHandler(log *slog.Logger, fn func(ctx context.Context) any) http.Handler
 func ReadyHandler(fn func(ctx context.Context) (bool, string)) http.Handler
 ```
 
-`HealthHandler` returns `200 OK` with a JSON body produced by `fn`. If JSON marshaling fails, it logs the error and returns `500 Internal Server Error`. `ReadyHandler` returns `200 OK` when `fn` returns `true`, or `503 Service Unavailable` with the reason string when it returns `false`.
+`HealthHandler` returns `200 OK` with `Content-Type: application/json` and a JSON body produced by `fn`. If JSON marshaling fails, it logs the error via the provided `log` and returns `500 Internal Server Error` with body `{"error":"health marshal failed"}` and `Content-Type: application/json`. `log` must be non-nil — `HealthHandler(nil, ...)` panics at construction time; service authors pass `sc.Log`.
+
+`ReadyHandler` returns `200 OK` with an empty body when `fn` returns `true`, or `503 Service Unavailable` with `Content-Type: text/plain; charset=utf-8` and the reason string verbatim as the body when it returns `false`.
 
 ```go
 mux := http.NewServeMux()
-mux.Handle("/healthz", scaffold.HealthHandler(func(ctx context.Context) any {
+mux.Handle("/healthz", scaffold.HealthHandler(sc.Log, func(ctx context.Context) any {
     return map[string]string{"db": db.Ping()}
 }))
 mux.Handle("/readyz", scaffold.ReadyHandler(func(ctx context.Context) (bool, string) {
@@ -357,7 +368,8 @@ A bug in a health or readiness handler cannot affect DUH-RPC endpoints — they 
 
 ```
 1. Log "daemon starting"
-2. Call OnStart(ctx, sc) — in Serve(): ctx derived from context.Background() with OnStartTimeout deadline (if non-zero);
+2. Call OnStart(ctx, sc) — in Serve(): ctx derived from the caller's ctx with OnStartTimeout deadline (if non-zero),
+                                       so caller cancellation propagates into OnStart;
                            in Start(): ctx is the caller's context passed directly
 3a. OnStart returns error → call OnStop (to clean up partial init) → abort, no ports opened
 3b. OnStart returns nil  → open bindings sequentially in Add() order
@@ -382,6 +394,12 @@ Because steps 5, 6, and 7 share a single deadline, service authors should keep `
 If `OnStart` returns an error, scaffold calls `OnStop` before returning, then runs `Cleaner.Clean` to unwind any partial initialization. `OnStart` should register cleanup with `sc.Cleaner` immediately alongside each initialization — not deferred to the end — so partial initialization is always cleaned up correctly.
 
 Bindings open sequentially in `Add()` order. If any binding fails to open, scaffold calls `OnStop` first, then closes any already-opened listeners. A partially-bound service never serves traffic.
+
+### Binding serve-loop exit
+
+A binding's serve-loop goroutine returning does **not**, by itself, initiate daemon shutdown. Shutdown is initiated only by the documented triggers above: SIGTERM/SIGINT, cancellation of the ctx passed to `Serve`, `Instance.Stop`, an `OnStart` error, or a `net.Listen` failure. If a binding stops serving on its own — an HTTP server crashing, a `ServeFunc` foreign server exiting unexpectedly — scaffold logs the event but leaves the remaining bindings running. The classification of "expected" vs. "unexpected" uses a scaffold-owned shutdown-requested flag rather than per-protocol sentinels, so new foreign serve loops are supported without scaffold needing to know their graceful-stop errors.
+
+The operational consequence: scaffold does not self-terminate on a single binding's failure. Service authors running multi-binding daemons should wire external liveness probes (Kubernetes liveness, systemd, or a `ReadyHandler` reflecting binding health) to decide whether a partially-dark process should be restarted. Authors who want a binding's crash to tear down the whole daemon can cancel the daemon's outer context from inside their own serve loop — that is an explicit opt-in, not a scaffold default. See ADR-0003 for the full rationale.
 
 ## Dependency Injection Pattern
 
@@ -457,11 +475,15 @@ The default `ConfigProvider` is `EnvConfigProvider` which reads environment vari
 ```go
 scaffold.Options{
     ConfigProvider: scaffold.MapConfigProvider{
-        "API_PORT":   "8443",
-        "ADMIN_PORT": "9090",
+        Values: map[string]string{
+            "API_PORT":   "8443",
+            "ADMIN_PORT": "9090",
+        },
     },
 }
 ```
+
+`MapConfigProvider` is a struct with `Values map[string]string` and `Logger *slog.Logger` fields. A nil `Values` is equivalent to an empty map: every lookup returns not-found or the configured fallback, so `MapConfigProvider{}` is a valid zero-value provider.
 
 ### Secrets
 
@@ -483,7 +505,7 @@ type FileConfigProvider struct {
 
 `sc.Log` is a `*slog.Logger` available throughout `OnStart`, middleware, and handlers. It is also accessible via `scaffold.GetLogger(ctx)` on the context passed to `OnStart` and any contexts derived from it during startup — it is **not** available on per-request contexts (see scaffold.DaemonConfig above).
 
-When `Options.Log` is nil, scaffold uses a built-in color logger that writes human-readable output to `os.Stdout`. It detects whether the output is a terminal: ANSI color is enabled in a TTY and suppressed otherwise.
+When `Options.Log` is nil, scaffold uses a built-in color logger that writes human-readable output to `os.Stdout`. Output is always ANSI-colorized and timestamps are omitted — the logger is a developer convenience, not a production target. Users who pipe output to a file or need structured JSON logs should provide their own `*slog.Logger` via `Options.Log`. The built-in logger is configured with `slog.LevelInfo` (matching slog's own default).
 
 ## Metrics
 
@@ -497,13 +519,13 @@ import (
 
 func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
     api := sc.Bindings.Add("api", sc.Config.IntOr("API_PORT", 8080))
-    api.UseMiddleware(scaffold.RequestID(), scaffold.PanicRecovery(sc.Log), sprometheus.HTTPMetrics(nil))
+    api.UseMiddleware(scaffold.PanicRecovery(sc.Log), sprometheus.HTTPMetrics(nil))
     api.SetTimeouts(10*time.Second, 30*time.Second, 120*time.Second)
     api.AddRPC(v1.NewServer(s.svc))
 
     admin := sc.Bindings.Add("admin", sc.Config.IntOr("ADMIN_PORT", 9090))
     adminMux := http.NewServeMux()
-    adminMux.Handle("/healthz", scaffold.HealthHandler(s.CheckHealth))
+    adminMux.Handle("/healthz", scaffold.HealthHandler(sc.Log, s.CheckHealth))
     adminMux.Handle("/readyz", scaffold.ReadyHandler(s.IsReady))
     adminMux.Handle("/metrics", promhttp.Handler())
     admin.SetMux(adminMux)
@@ -521,27 +543,13 @@ The `pattern` label uses Go 1.23's `r.Pattern` field rather than the raw request
 
 ## TLS
 
-TLS support lives in the `scaffold/autotls` subpackage. `autotls.Config` is the configuration struct; `autotls.Setup` validates it and populates `ServerTLS` and `ClientTLS`.
+Scaffold uses `github.com/kapetan-io/tackle/autotls` directly rather than providing its own TLS helper. Tackle's `autotls.Config` accepts file paths or PEM buffer inputs, supports outbound mTLS, defaults to TLS 1.3 minimum, and integrates with `*slog.Logger`. Refer to the tackle package for the full type; scaffold consumes it unchanged.
+
+Daemons call `autotls.Setup(&cfg)` to validate the config and populate `cfg.ServerTLS` / `cfg.ClientTLS`, then hand `ServerTLS` to a binding via `SetTLS`:
 
 ```go
-type Config struct {
-    CaFile   string
-    CertFile string
-    KeyFile  string
+import "github.com/kapetan-io/tackle/autotls"
 
-    ClientAuthCaFile string
-    ClientAuth       tls.ClientAuthType
-
-    AutoTLS bool // generate ephemeral certs — useful for dev and tests
-
-    ServerTLS *tls.Config // populated by Setup()
-    ClientTLS *tls.Config // populated by Setup()
-}
-
-func Setup(cfg *Config) error
-```
-
-```go
 func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
     tlsCfg := autotls.Config{
         CaFile:   sc.Secrets.StringOr("TLS_CA_FILE", ""),
@@ -554,7 +562,7 @@ func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error
 
     api := sc.Bindings.Add("api", sc.Config.IntOr("API_PORT", 8443))
     api.SetTLS(tlsCfg.ServerTLS)
-    api.UseMiddleware(scaffold.RequestID(), scaffold.PanicRecovery(sc.Log))
+    api.UseMiddleware(scaffold.PanicRecovery(sc.Log))
     api.AddRPC(v1.NewServer(s.svc))
 
     return nil
@@ -605,6 +613,7 @@ api/
 - **Constants** for every endpoint path — compile-time safety.
 - **Service interface** — one method per endpoint, fully typed.
 - **Server struct** — implements `RPCHandler` implicitly. No scaffold import. Dispatches to the service interface via a switch statement. Owns its own error writing.
+- **Encode/decode and error-writer helpers** — `decode`, `writeError`, `writeResponse` are generated into the package by DUH (or hand-written by the author for non-DUH handlers). Scaffold has no dependency on these helpers and no opinion about their format. See the Error Contract section above.
 - **Client** — used in tests and for service-to-service calls.
 
 ```go
@@ -641,6 +650,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) bool {
 ### Generated dispatch
 
 ```go
+// decode, writeError, and writeResponse are generated into this package by DUH
+// (or hand-written by the author) — they are NOT provided by scaffold.
 func (s *Server) handleTransferFunds(w http.ResponseWriter, r *http.Request) {
     var req TransferFundsRequest
     if err := decode(r, &req); err != nil {
@@ -696,7 +707,7 @@ func (b *BaseDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) err
     api.SetTimeouts(10*time.Second, 30*time.Second, 120*time.Second)
 
     adminMux := http.NewServeMux()
-    adminMux.Handle("/healthz", scaffold.HealthHandler(b.daemon.CheckHealth))
+    adminMux.Handle("/healthz", scaffold.HealthHandler(sc.Log, b.daemon.CheckHealth))
     adminMux.Handle("/readyz", scaffold.ReadyHandler(b.daemon.IsReady))
     admin.SetMux(adminMux)
 
@@ -774,12 +785,12 @@ func main() {
 ```go
 func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
     api := sc.Bindings.Add("api", sc.Config.IntOr("API_PORT", 8080))
-    api.UseMiddleware(scaffold.RequestID(), scaffold.PanicRecovery(sc.Log), RequireAuth())
+    api.UseMiddleware(scaffold.PanicRecovery(sc.Log), RequireAuth())
     api.SetTimeouts(10*time.Second, 30*time.Second, 120*time.Second)
     api.AddRPC(v1.NewServer(s.svc))
 
     mux := http.NewServeMux()
-    mux.Handle("/healthz", scaffold.HealthHandler(s.CheckHealth))
+    mux.Handle("/healthz", scaffold.HealthHandler(sc.Log, s.CheckHealth))
     mux.Handle("/readyz", scaffold.ReadyHandler(s.IsReady))
     api.SetMux(mux)
 
@@ -792,7 +803,7 @@ func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error
 ```go
 func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
     api := sc.Bindings.Add("api", sc.Config.IntOr("API_PORT", 8080))
-    api.UseMiddleware(scaffold.RequestID(), scaffold.PanicRecovery(sc.Log), RequireAuth())
+    api.UseMiddleware(scaffold.PanicRecovery(sc.Log), RequireAuth())
     api.SetTimeouts(10*time.Second, 30*time.Second, 120*time.Second)
 
     // v1 consulted first, v2 on fallthrough
@@ -802,7 +813,7 @@ func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error
     )
 
     mux := http.NewServeMux()
-    mux.Handle("/healthz", scaffold.HealthHandler(s.CheckHealth))
+    mux.Handle("/healthz", scaffold.HealthHandler(sc.Log, s.CheckHealth))
     mux.Handle("/readyz", scaffold.ReadyHandler(s.IsReady))
     api.SetMux(mux)
 
@@ -815,14 +826,13 @@ func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error
 ```go
 func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
     api := sc.Bindings.Add("api", sc.Config.IntOr("API_PORT", 8080))
-    api.UseMiddleware(scaffold.RequestID(), scaffold.PanicRecovery(sc.Log), RequireAuth())
+    api.UseMiddleware(scaffold.PanicRecovery(sc.Log), RequireAuth())
     api.SetTimeouts(10*time.Second, 30*time.Second, 120*time.Second)
     api.AddRPC(v1.NewServer(s.svc))
 
     admin := sc.Bindings.Add("admin", sc.Config.IntOr("ADMIN_PORT", 9090))
-    admin.UseMiddleware(scaffold.RequestID())
     adminMux := http.NewServeMux()
-    adminMux.Handle("/healthz", scaffold.HealthHandler(s.CheckHealth))
+    adminMux.Handle("/healthz", scaffold.HealthHandler(sc.Log, s.CheckHealth))
     adminMux.Handle("/readyz", scaffold.ReadyHandler(s.IsReady))
     adminMux.Handle("/metrics", promhttp.Handler())
     admin.SetMux(adminMux)
@@ -836,7 +846,7 @@ func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error
 ```go
 func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
     api := sc.Bindings.Add("api", sc.Config.IntOr("API_PORT", 8080))
-    api.UseMiddleware(scaffold.RequestID(), scaffold.PanicRecovery(sc.Log), RequireAuth())
+    api.UseMiddleware(scaffold.PanicRecovery(sc.Log), RequireAuth())
     api.SetTimeouts(10*time.Second, 30*time.Second, 120*time.Second)
     api.AddRPC(v1.NewServer(s.svc))
 
@@ -869,7 +879,7 @@ func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error
     api := sc.Bindings.Add("api", sc.Config.IntOr("API_PORT", 8443))
     api.SetTLS(apiTLS.ServerTLS)
     api.SetTimeouts(10*time.Second, 30*time.Second, 120*time.Second)
-    api.UseMiddleware(scaffold.RequestID(), scaffold.PanicRecovery(sc.Log), RequireAuth())
+    api.UseMiddleware(scaffold.PanicRecovery(sc.Log), RequireAuth())
     api.AddRPC(v1.NewServer(s.svc))
 
     adminTLS := autotls.Config{
@@ -886,7 +896,7 @@ func (s *MyDaemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error
     admin := sc.Bindings.Add("admin", sc.Config.IntOr("ADMIN_PORT", 9090))
     admin.SetTLS(adminTLS.ServerTLS)
     adminMux := http.NewServeMux()
-    adminMux.Handle("/healthz", scaffold.HealthHandler(s.CheckHealth))
+    adminMux.Handle("/healthz", scaffold.HealthHandler(sc.Log, s.CheckHealth))
     adminMux.Handle("/readyz", scaffold.ReadyHandler(s.IsReady))
     admin.SetMux(adminMux)
 
@@ -922,7 +932,7 @@ require.NoError(t, inst.Stop(ctx))
 // Full integration — specific ports for e2e
 inst, err := scaffold.Start(ctx, daemon, &scaffold.Options{
     Bindings: &scaffold.DefaultBindings{},
-    ConfigProvider: scaffold.MapConfigProvider{"API_PORT": "8443"},
+    ConfigProvider: scaffold.MapConfigProvider{Values: map[string]string{"API_PORT": "8443"}},
 })
 
 // Unit — direct method call, no framework
