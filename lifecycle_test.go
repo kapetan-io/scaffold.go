@@ -58,7 +58,7 @@ func TestStartHappyPathSingleBindingRoundTrip(t *testing.T) {
 
 	resp, err := httpGetViaDaemon(t, inst, "api", "/hello")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	body, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, "hi", string(body))
@@ -151,7 +151,7 @@ func TestStartSecondBindingFailsToOpenClosesFirstAndCallsOnStop(t *testing.T) {
 	// returns EADDRINUSE.
 	reserved, err := net.Listen("tcp", ":0")
 	require.NoError(t, err)
-	defer reserved.Close()
+	defer func() { _ = reserved.Close() }()
 	reservedPort := reserved.Addr().(*net.TCPAddr).Port
 
 	opts, _ := newTestOptions()
@@ -221,7 +221,7 @@ func TestStartGracefulDrainInFlightHandler(t *testing.T) {
 			rc <- result{err: err}
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		body, _ := io.ReadAll(resp.Body)
 		rc <- result{body: string(body)}
 	}()
@@ -273,7 +273,7 @@ func TestStartPanicRecoveryInHandler(t *testing.T) {
 
 	resp, err := httpGetViaDaemon(t, inst, "api", "/boom")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 	body, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, "internal server error", string(body))
@@ -303,7 +303,7 @@ func TestStartRPCChainFallthroughThenSetMuxThen404(t *testing.T) {
 	// Route that the mux knows about — RPC chain falls through, mux handles it.
 	resp, err := httpGetViaDaemon(t, inst, "api", "/mux")
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, 1, count1)
 	assert.Equal(t, 1, count2)
@@ -311,7 +311,7 @@ func TestStartRPCChainFallthroughThenSetMuxThen404(t *testing.T) {
 	// Route that neither RPC nor mux handles → 404.
 	resp, err = httpGetViaDaemon(t, inst, "api", "/nope")
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
@@ -347,7 +347,7 @@ func TestStartMiddlewareExecutesInRegistrationOrder(t *testing.T) {
 
 	resp, err := httpGetViaDaemon(t, inst, "api", "/x")
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -385,7 +385,7 @@ func TestStartServeFuncBindingListenerHandoff(t *testing.T) {
 	addr := inst.Addr("custom")
 	conn, err := net.DialTimeout("tcp", addr.String(), time.Second)
 	require.NoError(t, err)
-	conn.Close()
+	_ = conn.Close()
 
 	require.NoError(t, inst.Stop(context.Background()))
 }
@@ -419,7 +419,7 @@ func TestStartTLSRoundTripWithAutoTLS(t *testing.T) {
 	u := &url.URL{Scheme: "https", Host: addr.String(), Path: "/secure"}
 	resp, err := client.Get(u.String())
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	body, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, "tls-ok", string(body))
@@ -625,7 +625,7 @@ func TestPerRequestContextIsNotEnriched(t *testing.T) {
 
 	resp, err := httpGetViaDaemon(t, inst, "api", "/")
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	assert.Nil(t, seenLogger)
 }
 
@@ -647,7 +647,7 @@ func TestBindingExitWhileShutdownRequestedSilentForNilReturn(t *testing.T) {
 						// Return nil to exercise the silent-swallow path.
 						return nil
 					}
-					conn.Close()
+					_ = conn.Close()
 				}
 			})
 			sc.Cleaner.Add(func(_ context.Context) error {

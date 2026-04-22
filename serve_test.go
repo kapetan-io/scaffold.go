@@ -147,7 +147,7 @@ func TestServeOnStartErrorReturnsExitFailure(t *testing.T) {
 func TestServeBindFailureReturnsExitFailure(t *testing.T) {
 	reserved, err := net.Listen("tcp", ":0")
 	require.NoError(t, err)
-	defer reserved.Close()
+	defer func() { _ = reserved.Close() }()
 	reservedPort := reserved.Addr().(*net.TCPAddr).Port
 
 	log, _ := newTestLogger()

@@ -76,7 +76,6 @@ type Instance struct {
 	cleaner       *Cleaner
 	shutdownFlag  *atomic.Bool
 	once          sync.Once
-	onStopTimeout time.Duration
 }
 
 // Addr returns the net.Addr the named binding is listening on. Panics if
