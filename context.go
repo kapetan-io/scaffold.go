@@ -32,21 +32,17 @@ func GetLogger(ctx context.Context) *slog.Logger {
 	return v
 }
 
-// withConfig returns ctx with c attached under the private config key. The
-// Phase 3 lifecycle uses it to enrich OnStart and OnStop contexts; Phase 1
-// exposes only the accessor counterpart through the public API.
-//
-//nolint:unused // consumed by the Phase 3 lifecycle orchestrator.
+// withConfig returns ctx with c attached under the private config key.
+// The lifecycle orchestrator uses it to enrich OnStart and OnStop
+// contexts; GetConfig is the public accessor counterpart.
 func withConfig(ctx context.Context, c ConfigProvider) context.Context {
 	return context.WithValue(ctx, configCtxKey{}, c)
 }
 
-//nolint:unused // consumed by the Phase 3 lifecycle orchestrator.
 func withSecrets(ctx context.Context, c ConfigProvider) context.Context {
 	return context.WithValue(ctx, secretsCtxKey{}, c)
 }
 
-//nolint:unused // consumed by the Phase 3 lifecycle orchestrator.
 func withLogger(ctx context.Context, l *slog.Logger) context.Context {
 	return context.WithValue(ctx, loggerCtxKey{}, l)
 }

@@ -149,10 +149,8 @@ func (b *Binding) ServeFunc(fn func(net.Listener) error) {
 // middleware chain wraps the dispatcher in reverse index order so that the
 // first-registered middleware is outermost.
 //
-// Called by the Phase 3 lifecycle orchestrator once OnStart returns nil and
+// Called by the lifecycle orchestrator once OnStart returns nil and
 // before net.Listen.
-//
-//nolint:unused // consumed by the Phase 3 lifecycle orchestrator.
 func (b *Binding) buildHandler() http.Handler {
 	rpcHandlers := b.rpcHandlers
 	mux := b.mux

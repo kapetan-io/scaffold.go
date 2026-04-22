@@ -4,7 +4,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
 	"sync"
+
+	"github.com/kapetan-io/scaffold"
 )
 
 // testLogHandlerCore holds the shared state for a testLogHandler; values of
@@ -106,4 +109,83 @@ func recordAttr(r slog.Record, key string) (slog.Attr, bool) {
 // test.
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// fakeDaemon is a minimal scaffold.Daemon used by lifecycle tests. OnStart
+// and OnStop hooks are configurable; the events slice records the
+// invocation sequence for ordering assertions. The mu mutex guards events
+// so concurrent cleaner functions can record safely.
+type fakeDaemon struct {
+	mu      sync.Mutex
+	events  []string
+	OnStart func(ctx context.Context, sc *scaffold.DaemonConfig) error
+	OnStop  func(ctx context.Context) error
+}
+
+func (f *fakeDaemon) onStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
+	f.appendEvent("onstart")
+	if f.OnStart != nil {
+		return f.OnStart(ctx, sc)
+	}
+	return nil
+}
+
+func (f *fakeDaemon) onStop(ctx context.Context) error {
+	f.appendEvent("onstop")
+	if f.OnStop != nil {
+		return f.OnStop(ctx)
+	}
+	return nil
+}
+
+func (f *fakeDaemon) appendEvent(e string) {
+	f.mu.Lock()
+	f.events = append(f.events, e)
+	f.mu.Unlock()
+}
+
+// Events returns a copy of the captured event slice.
+func (f *fakeDaemon) Events() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.events))
+	copy(out, f.events)
+	return out
+}
+
+// daemonAdapter wraps fakeDaemon to satisfy scaffold.Daemon using the
+// unexported onStart / onStop methods so tests can share a single
+// fakeDaemon type.
+type daemonAdapter struct{ f *fakeDaemon }
+
+func (d daemonAdapter) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
+	return d.f.onStart(ctx, sc)
+}
+
+func (d daemonAdapter) OnStop(ctx context.Context) error {
+	return d.f.onStop(ctx)
+}
+
+// asDaemon returns a scaffold.Daemon backed by f.
+func asDaemon(f *fakeDaemon) scaffold.Daemon {
+	return daemonAdapter{f: f}
+}
+
+// fakeRPCHandler is a minimal scaffold.RPCHandler used by RPC chain tests.
+// result is the value ServeHTTP returns; called is incremented on each
+// invocation so tests can assert ordering.
+type fakeRPCHandler struct {
+	result bool
+	called *int
+	write  func(w http.ResponseWriter)
+}
+
+func (h *fakeRPCHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) bool {
+	if h.called != nil {
+		*h.called++
+	}
+	if h.result && h.write != nil {
+		h.write(w)
+	}
+	return h.result
 }

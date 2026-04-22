@@ -66,10 +66,8 @@ func (s *bindingStore) Get(name string) *Binding {
 }
 
 // orderedBindings returns a snapshot of the registered bindings in the
-// order they were added. The Phase 3 lifecycle orchestrator uses this to
-// open listeners in Add-order and tear them down in reverse order.
-//
-//nolint:unused // consumed by the Phase 3 lifecycle orchestrator.
+// order they were added. The lifecycle orchestrator uses this to open
+// listeners in Add-order and tear them down in reverse order.
 func (s *bindingStore) orderedBindings() []*Binding {
 	s.mu.Lock()
 	defer s.mu.Unlock()
