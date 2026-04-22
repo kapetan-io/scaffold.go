@@ -477,8 +477,37 @@ func TestStartOnStopErrorDoesNotPreventCleanerRun(t *testing.T) {
 	}
 	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
 	require.NoError(t, err)
-	require.NoError(t, inst.Stop(context.Background()))
+	require.ErrorContains(t, inst.Stop(context.Background()), "onstop boom")
 	assert.True(t, cleanerRan.Load())
+}
+
+func TestStartStopReturnsOnStopError(t *testing.T) {
+	opts, _ := newTestOptions()
+	sentinel := errors.New("onstop sentinel")
+	f := &fakeDaemon{
+		OnStop: func(_ context.Context) error {
+			return sentinel
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	stopErr := inst.Stop(context.Background())
+	require.Error(t, stopErr)
+	require.ErrorIs(t, stopErr, sentinel)
+}
+
+func TestStartStopSubsequentCallsReturnNil(t *testing.T) {
+	opts, _ := newTestOptions()
+	f := &fakeDaemon{
+		OnStop: func(_ context.Context) error {
+			return errors.New("onstop boom")
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.Error(t, inst.Stop(context.Background()))
+	require.NoError(t, inst.Stop(context.Background()))
+	require.NoError(t, inst.Stop(context.Background()))
 }
 
 func TestStartOnStopPanicDoesNotPreventCleanerRun(t *testing.T) {

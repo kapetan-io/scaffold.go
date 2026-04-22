@@ -94,20 +94,23 @@ func (i *Instance) Addr(name string) net.Addr {
 	return b.addr
 }
 
-// Stop runs the shutdown sequence exactly once. Subsequent calls return
-// nil without re-running any step. Bindings are torn down in reverse Add
-// order, then daemon.OnStop and Cleaner.Clean run. Errors in any step are
-// logged and execution continues; panics in OnStop and srv.Shutdown are
-// recovered so Cleaner.Clean always runs.
+// Stop runs the shutdown sequence exactly once. The first call returns a
+// non-nil error joining any shutdown-path failures (OnStop errors,
+// http.Server.Shutdown errors, Cleaner.Clean errors). Subsequent calls
+// return nil without re-running any step. Bindings are torn down in
+// reverse Add order, then daemon.OnStop and Cleaner.Clean run. Errors in
+// any step are logged and execution continues; panics in OnStop and
+// srv.Shutdown are recovered so Cleaner.Clean always runs.
 func (i *Instance) Stop(ctx context.Context) error {
+	var err error
 	i.once.Do(func() {
 		i.shutdownFlag.Store(true)
 		enriched := enrichCtx(ctx, i.config, i.secrets, i.log)
 		i.log.Info("shutdown initiated", "reason", reasonInstanceStop)
-		runShutdown(enriched, i.log, i.bindingsOrder, i.daemon, i.cleaner)
+		err = runShutdown(enriched, i.log, i.bindingsOrder, i.daemon, i.cleaner)
 		i.log.Info("daemon stopped")
 	})
-	return nil
+	return err
 }
 
 // enrichCtx attaches the config, secrets, and logger to ctx for retrieval
@@ -121,23 +124,35 @@ func enrichCtx(ctx context.Context, cfg, sec ConfigProvider, log *slog.Logger) c
 
 // runShutdown executes the reverse-order binding teardown, OnStop, and
 // Cleaner.Clean steps using the enriched ctx. Each step's failures are
-// logged and do not abort subsequent steps.
-func runShutdown(ctx context.Context, log *slog.Logger, order []*Binding, d Daemon, c *Cleaner) {
+// logged and do not abort subsequent steps. Returns the joined error of
+// every shutdown-path failure so callers that need to surface them (such
+// as Instance.Stop) can do so; recovered panics are logged but not
+// returned.
+func runShutdown(ctx context.Context, log *slog.Logger, order []*Binding, d Daemon, c *Cleaner) error {
+	var errs []error
 	for i := len(order) - 1; i >= 0; i-- {
-		shutdownBinding(ctx, log, order[i])
+		if err := shutdownBinding(ctx, log, order[i]); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	callOnStop(ctx, log, d)
+	if err := callOnStop(ctx, log, d); err != nil {
+		errs = append(errs, err)
+	}
 	if err := c.Clean(ctx); err != nil {
 		log.Error("cleaner returned error", "error", err)
+		errs = append(errs, err)
 	}
+	return errors.Join(errs...)
 }
 
 // shutdownBinding calls srv.Shutdown for HTTP bindings; ServeFunc
 // bindings are untouched (the user's Cleaner is responsible for stopping
-// the foreign serve loop). Panics and errors are recovered and logged.
-func shutdownBinding(ctx context.Context, log *slog.Logger, b *Binding) {
+// the foreign serve loop). Panics and errors are recovered and logged;
+// the srv.Shutdown error (if any) is returned for collection by
+// runShutdown. Recovered panics do not produce a returned error.
+func shutdownBinding(ctx context.Context, log *slog.Logger, b *Binding) (err error) {
 	if b.srv == nil {
-		return
+		return nil
 	}
 	defer func() {
 		if r := recover(); r != nil {
@@ -147,16 +162,19 @@ func shutdownBinding(ctx context.Context, log *slog.Logger, b *Binding) {
 				"stack", string(debug.Stack()))
 		}
 	}()
-	if err := b.srv.Shutdown(ctx); err != nil {
+	if err = b.srv.Shutdown(ctx); err != nil {
 		log.Error("binding shutdown returned error",
 			"binding", b.name,
 			"error", err)
 	}
+	return err
 }
 
 // callOnStop invokes d.OnStop with panic recovery. The shutdown sequence
-// continues regardless of panic or error.
-func callOnStop(ctx context.Context, log *slog.Logger, d Daemon) {
+// continues regardless of panic or error. Returns the OnStop error (if
+// any) for collection by runShutdown. Recovered panics do not produce a
+// returned error.
+func callOnStop(ctx context.Context, log *slog.Logger, d Daemon) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("OnStop panicked",
@@ -164,9 +182,10 @@ func callOnStop(ctx context.Context, log *slog.Logger, d Daemon) {
 				"stack", string(debug.Stack()))
 		}
 	}()
-	if err := d.OnStop(ctx); err != nil {
+	if err = d.OnStop(ctx); err != nil {
 		log.Error("OnStop returned error", "error", err)
 	}
+	return err
 }
 
 // Start runs a daemon in test mode. It resolves Options defaults, invokes
@@ -201,21 +220,21 @@ func Start(ctx context.Context, d Daemon, opts *Options) (*Instance, error) {
 	if err := d.OnStart(startCtx, sc); err != nil {
 		log.Error("OnStart returned error", "error", err)
 		flag.Store(true)
-		runShutdown(startCtx, log, nil, d, cleaner)
+		_ = runShutdown(startCtx, log, nil, d, cleaner)
 		return nil, err
 	}
 
 	order, err := orderedFromBindings(bindings)
 	if err != nil {
 		flag.Store(true)
-		runShutdown(startCtx, log, nil, d, cleaner)
+		_ = runShutdown(startCtx, log, nil, d, cleaner)
 		return nil, err
 	}
 
 	opened, openErr := openBindings(startCtx, log, order, flag)
 	if openErr != nil {
 		flag.Store(true)
-		runShutdown(startCtx, log, opened, d, cleaner)
+		_ = runShutdown(startCtx, log, opened, d, cleaner)
 		return nil, openErr
 	}
 
@@ -276,7 +295,7 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 		shutdownCtx, cancel := buildShutdownCtx(opts.OnStopTimeout)
 		defer cancel()
 		enriched := enrichCtx(shutdownCtx, cfgProv, secProv, log)
-		runShutdown(enriched, log, nil, d, cleaner)
+		_ = runShutdown(enriched, log, nil, d, cleaner)
 		return ExitFailure
 	}
 	if cancelStart != nil {
@@ -290,7 +309,7 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 		shutdownCtx, cancel := buildShutdownCtx(opts.OnStopTimeout)
 		defer cancel()
 		enriched := enrichCtx(shutdownCtx, cfgProv, secProv, log)
-		runShutdown(enriched, log, nil, d, cleaner)
+		_ = runShutdown(enriched, log, nil, d, cleaner)
 		return ExitFailure
 	}
 
@@ -300,7 +319,7 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 		shutdownCtx, cancel := buildShutdownCtx(opts.OnStopTimeout)
 		defer cancel()
 		enriched := enrichCtx(shutdownCtx, cfgProv, secProv, log)
-		runShutdown(enriched, log, opened, d, cleaner)
+		_ = runShutdown(enriched, log, opened, d, cleaner)
 		return ExitFailure
 	}
 
@@ -323,7 +342,7 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 	shutdownCtx, cancel := buildShutdownCtx(opts.OnStopTimeout)
 	defer cancel()
 	enriched := enrichCtx(shutdownCtx, cfgProv, secProv, log)
-	runShutdown(enriched, log, opened, d, cleaner)
+	_ = runShutdown(enriched, log, opened, d, cleaner)
 	log.Info("daemon stopped")
 	return ExitSuccess
 }
