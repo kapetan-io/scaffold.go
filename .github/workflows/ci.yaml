@@ -10,6 +10,7 @@ permissions:
 
 env:
   GOLANGCI_LINT_VERSION: v2.11.4
+  GOVULNCHECK_VERSION: v1.1.4
 
 jobs:
   ci:
@@ -31,6 +32,14 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
             | sh -s -- -b "$(go env GOPATH)/bin" "${GOLANGCI_LINT_VERSION}"
 
+      - name: Cache golangci-lint analysis
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/golangci-lint
+          key: golangci-lint-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-${{ hashFiles('**/go.sum', '.golangci.yml', '.golangci.yaml') }}
+          restore-keys: |
+            golangci-lint-${{ runner.os }}-${{ env.GOLANGCI_LINT_VERSION }}-
+
       - name: Run make ci
         run: make ci
 
@@ -48,8 +57,20 @@ jobs:
           cache-dependency-path: ./go.sum
           check-latest: true
 
+      - name: Resolve GOPATH/bin
+        id: gopath
+        run: echo "bin=$(go env GOPATH)/bin" >> "$GITHUB_OUTPUT"
+
+      - name: Cache govulncheck binary
+        id: govulncheck-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.gopath.outputs.bin }}/govulncheck
+          key: govulncheck-${{ runner.os }}-${{ env.GOVULNCHECK_VERSION }}
+
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        if: steps.govulncheck-cache.outputs.cache-hit != 'true'
+        run: go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
 
       - name: Run govulncheck
         run: govulncheck ./...
