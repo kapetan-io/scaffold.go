@@ -9,11 +9,9 @@ import (
 // daemon. Options.Bindings accepts any implementation; the two built-ins
 // (DefaultBindings, TestBindings) cover production and standard test use.
 //
-// Third-party implementations are not a supported v1 extension point — the
-// Phase 3 lifecycle orchestrator iterates bindings in Add-order via an
-// unexported method that only the built-in bindingStore provides. See the
-// plan's "What We're NOT Doing" section for the rationale and migration
-// path.
+// Third-party implementations are not a supported v1 extension point —
+// the lifecycle needs Add-order iteration via an unexported method that
+// only the built-in bindingStore provides.
 type Bindings interface {
 	// Add registers a new binding under name with the given port hint and
 	// returns the *Binding for further configuration. Panics if name is
@@ -26,8 +24,8 @@ type Bindings interface {
 
 // bindingStore is the shared implementation embedded by DefaultBindings and
 // TestBindings. It tracks bindings both by name (for Get) and by insertion
-// order (so the Phase 3 orchestrator can iterate in Add-order for
-// deterministic open / reverse-teardown sequencing).
+// order so the lifecycle orchestrator can iterate in Add-order for
+// deterministic open / reverse-teardown sequencing.
 type bindingStore struct {
 	mu     sync.Mutex
 	order  []string
@@ -35,10 +33,9 @@ type bindingStore struct {
 }
 
 // add is the shared mutator DefaultBindings and TestBindings call to insert
-// a new binding. The caller supplies the effective port and listen address
-// so that the two built-ins can diverge on that dimension without
-// duplicating the store bookkeeping.
-func (s *bindingStore) add(name string, port int, listenAddr string) *Binding {
+// a new binding. The caller supplies the listen address so the two built-ins
+// can diverge on that dimension without duplicating the store bookkeeping.
+func (s *bindingStore) add(name, listenAddr string) *Binding {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.byName == nil {
@@ -49,7 +46,6 @@ func (s *bindingStore) add(name string, port int, listenAddr string) *Binding {
 	}
 	b := &Binding{
 		name:       name,
-		port:       port,
 		listenAddr: listenAddr,
 	}
 	s.byName[name] = b
@@ -87,7 +83,7 @@ type DefaultBindings struct {
 // Add registers a new binding under name that will listen on :port when the
 // daemon starts. Panics if name is already registered.
 func (d *DefaultBindings) Add(name string, port int) *Binding {
-	return d.add(name, port, fmt.Sprintf(":%d", port))
+	return d.add(name, fmt.Sprintf(":%d", port))
 }
 
 // TestBindings is the test-oriented Bindings implementation. Every
@@ -103,5 +99,5 @@ type TestBindings struct {
 // compatibility but ignored. Panics if name is already registered.
 func (t *TestBindings) Add(name string, port int) *Binding {
 	_ = port
-	return t.add(name, 0, "127.0.0.1:0")
+	return t.add(name, "127.0.0.1:0")
 }

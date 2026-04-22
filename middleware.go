@@ -68,3 +68,10 @@ func (w *panicTrackingWriter) Write(b []byte) (int, error) {
 	w.written = true
 	return w.ResponseWriter.Write(b)
 }
+
+// Unwrap exposes the underlying http.ResponseWriter so handlers using
+// http.NewResponseController (and thereby Flusher / Hijacker) continue to
+// work when PanicRecovery is in the middleware chain.
+func (w *panicTrackingWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}

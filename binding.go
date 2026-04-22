@@ -32,7 +32,6 @@ type RPCHandler interface {
 // listenAddr.
 type Binding struct {
 	name       string
-	port       int
 	listenAddr string
 
 	mws         []MiddlewareFunc
@@ -142,15 +141,10 @@ func (b *Binding) ServeFunc(fn func(net.Listener) error) {
 	b.serveFunc = fn
 }
 
-// buildHandler composes the final http.Handler for this binding. The inner
-// dispatcher iterates b.rpcHandlers in registration order, stopping on the
-// first handler whose ServeHTTP returns true; if every handler returns
-// false, it delegates to b.mux (or writes 404 when no mux is set). The
-// middleware chain wraps the dispatcher in reverse index order so that the
-// first-registered middleware is outermost.
-//
-// Called by the lifecycle orchestrator once OnStart returns nil and
-// before net.Listen.
+// buildHandler composes the final http.Handler for this binding: the RPC
+// chain runs in registration order, falls through to the mux (or a 404
+// default) when no handler short-circuits, and is wrapped in middleware
+// so the first-registered middleware is outermost.
 func (b *Binding) buildHandler() http.Handler {
 	rpcHandlers := b.rpcHandlers
 	mux := b.mux

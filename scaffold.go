@@ -5,9 +5,6 @@
 // health and readiness handlers, TLS integration, and panic recovery — so
 // that service authors can focus on the business logic they implement
 // inside OnStart and OnStop hooks.
-//
-// See docs/features/mvp/prd.md for the product rationale and
-// docs/features/mvp/tech-spec.md for the authoritative design decisions.
 package scaffold
 
 import (
@@ -30,6 +27,15 @@ import (
 const (
 	ExitSuccess = 0
 	ExitFailure = 1
+)
+
+// Pinned values for the "reason" field of the "shutdown initiated" log
+// record. The field values are an operator-facing contract (alert rules,
+// log queries); keep them stable.
+const (
+	reasonInstanceStop = "instance_stop"
+	reasonSignal       = "signal"
+	reasonContext      = "context"
 )
 
 // Daemon is the user-implemented contract scaffold drives. OnStart runs
@@ -89,24 +95,15 @@ func (i *Instance) Addr(name string) net.Addr {
 }
 
 // Stop runs the shutdown sequence exactly once. Subsequent calls return
-// nil without re-running any step. The shutdown sequence is:
-//  1. Set the shutdown-requested flag.
-//  2. Enrich ctx with config, secrets, and logger.
-//  3. Log "shutdown initiated" (reason=instance_stop).
-//  4. For each binding in reverse Add order, call srv.Shutdown for HTTP
-//     bindings; ServeFunc bindings are left to the user's Cleaner.
-//  5. Call daemon.OnStop.
-//  6. Call Cleaner.Clean.
-//  7. Log "daemon stopped".
-//
-// Errors in any step are logged and execution proceeds to the next step.
-// Panics in OnStop and srv.Shutdown are recovered and logged; the
-// sequence continues so Cleaner.Clean always runs.
+// nil without re-running any step. Bindings are torn down in reverse Add
+// order, then daemon.OnStop and Cleaner.Clean run. Errors in any step are
+// logged and execution continues; panics in OnStop and srv.Shutdown are
+// recovered so Cleaner.Clean always runs.
 func (i *Instance) Stop(ctx context.Context) error {
 	i.once.Do(func() {
 		i.shutdownFlag.Store(true)
 		enriched := enrichCtx(ctx, i.config, i.secrets, i.log)
-		i.log.Info("shutdown initiated", "reason", "instance_stop")
+		i.log.Info("shutdown initiated", "reason", reasonInstanceStop)
 		runShutdown(enriched, i.log, i.bindingsOrder, i.daemon, i.cleaner)
 		i.log.Info("daemon stopped")
 	})
@@ -316,10 +313,10 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 	select {
 	case sig := <-sigCh:
 		log.Info("shutdown initiated",
-			"reason", "signal",
+			"reason", reasonSignal,
 			"signal", sig.String())
 	case <-ctx.Done():
-		log.Info("shutdown initiated", "reason", "context")
+		log.Info("shutdown initiated", "reason", reasonContext)
 	}
 
 	flag.Store(true)
@@ -370,15 +367,12 @@ func resolveConfig(p ConfigProvider, log *slog.Logger) ConfigProvider {
 	return &EnvConfigProvider{Logger: log}
 }
 
-// orderedFromBindings extracts the binding order from b's embedded
-// bindingStore. Returns an error if b does not embed bindingStore — this
-// is a known v1 limitation documented under the plan's "What We're NOT
-// Doing" section; third-party Bindings implementations cannot satisfy
-// the unexported orderedBindings() method.
+// orderedFromBindings extracts the binding order from b. The lifecycle
+// needs Add-order iteration to open bindings deterministically and tear
+// them down in reverse; only DefaultBindings and TestBindings (which
+// embed bindingStore) provide the unexported orderedBindings() method.
+// Third-party Bindings implementations are not a supported v1 extension.
 func orderedFromBindings(b Bindings) ([]*Binding, error) {
-	// See plans/scaffold-mvp-implementation-plan.md "What We're NOT Doing":
-	// the lifecycle needs Add-order iteration which only the built-in
-	// bindingStore provides via the unexported orderedBindings() method.
 	src, ok := b.(interface{ orderedBindings() []*Binding })
 	if !ok {
 		return nil, errors.New("scaffold: Bindings implementation does not support ordered iteration; only DefaultBindings and TestBindings are supported in v1")
@@ -430,9 +424,8 @@ func openBindings(
 // runBindingServeLoop invokes the binding's serve function (HTTP or
 // user-supplied ServeFunc) and classifies the return value using the
 // shutdown-requested flag. Returns that arrive after shutdown is
-// requested are expected; other returns are logged at error level. The
-// daemon is never torn down as a side effect of a single binding's
-// goroutine exiting (ADR-0003).
+// requested are expected; other returns are logged at error level. A
+// single binding's goroutine exiting never triggers daemon teardown.
 func runBindingServeLoop(log *slog.Logger, b *Binding, ln net.Listener, flag *atomic.Bool) {
 	var err error
 	switch {

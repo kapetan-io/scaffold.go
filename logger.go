@@ -2,7 +2,6 @@ package scaffold
 
 import (
 	"log/slog"
-	"os"
 
 	"github.com/kapetan-io/tackle/color"
 )
@@ -13,7 +12,6 @@ import (
 // to a file should provide their own *slog.Logger via Options.Log.
 func defaultLogger() *slog.Logger {
 	handler := color.NewLog(&color.LogOptions{
-		Writer: os.Stdout,
 		HandlerOptions: slog.HandlerOptions{
 			Level:       slog.LevelInfo,
 			ReplaceAttr: color.SuppressAttrs(slog.TimeKey),
