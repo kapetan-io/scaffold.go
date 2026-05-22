@@ -17,6 +17,7 @@ import (
 
 	"github.com/kapetan-io/scaffold"
 	"github.com/kapetan-io/tackle/autotls"
+	"github.com/kapetan-io/tackle/clock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1136,4 +1137,31 @@ func TestStartBeforeShutdownSkippedOnBindFailure(t *testing.T) {
 	require.Error(t, err)
 
 	assert.False(t, called.Load())
+}
+
+func TestStartUsesInjectedClock(t *testing.T) {
+	opts, _ := newTestOptions()
+	opts.Clock = clock.NewProvider()
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/hello", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("hi"))
+			})
+			sc.Bindings.Add("api", 0).SetMux(mux)
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+
+	resp, err := httpGetViaDaemon(t, inst, "api", "/hello")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, "hi", string(body))
+
+	require.NoError(t, inst.Stop(context.Background()))
 }

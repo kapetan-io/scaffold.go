@@ -21,6 +21,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/kapetan-io/tackle/clock"
 )
 
 // Exit codes returned by Serve.
@@ -88,6 +90,7 @@ type Options struct {
 	Log             *slog.Logger
 	OnStartTimeout  time.Duration
 	OnStopTimeout   time.Duration
+	Clock           *clock.Provider
 }
 
 // Instance is the handle returned by Start. It exposes the listener
@@ -248,6 +251,7 @@ func Start(ctx context.Context, d Daemon, opts *Options) (*Instance, error) {
 	bindings := resolveBindings(opts.Bindings, false)
 	cfgProv := resolveConfig(opts.ConfigProvider, log)
 	secProv := resolveConfig(opts.SecretsProvider, log)
+	clk := resolveClock(opts.Clock)
 	cleaner := NewCleaner(log)
 	flag := &atomic.Bool{}
 
@@ -275,7 +279,7 @@ func Start(ctx context.Context, d Daemon, opts *Options) (*Instance, error) {
 		return nil, err
 	}
 
-	opened, openErr := openBindings(startCtx, log, order, flag)
+	opened, openErr := openBindings(startCtx, log, order, flag, clk)
 	if openErr != nil {
 		flag.Store(true)
 		_ = runShutdown(startCtx, log, nil, opened, d, cleaner)
@@ -309,6 +313,7 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 	bindings := resolveBindings(opts.Bindings, true)
 	cfgProv := resolveConfig(opts.ConfigProvider, log)
 	secProv := resolveConfig(opts.SecretsProvider, log)
+	clk := resolveClock(opts.Clock)
 	cleaner := NewCleaner(log)
 	flag := &atomic.Bool{}
 
@@ -354,7 +359,7 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 		return ExitFailure
 	}
 
-	opened, openErr := openBindings(enrichedStart, log, order, flag)
+	opened, openErr := openBindings(enrichedStart, log, order, flag, clk)
 	if openErr != nil {
 		if cancelStart != nil {
 			cancelStart()
@@ -435,6 +440,14 @@ func resolveConfig(p ConfigProvider, log *slog.Logger) ConfigProvider {
 	return &EnvConfigProvider{Logger: log}
 }
 
+// resolveClock returns c or a real-time clock.Provider when c is nil.
+func resolveClock(c *clock.Provider) *clock.Provider {
+	if c != nil {
+		return c
+	}
+	return clock.NewProvider()
+}
+
 // orderedFromBindings extracts the binding order from b. The lifecycle
 // needs Add-order iteration to open bindings deterministically and tear
 // them down in reverse; only DefaultBindings and TestBindings (which
@@ -457,6 +470,7 @@ func openBindings(
 	log *slog.Logger,
 	order []*Binding,
 	flag *atomic.Bool,
+	clk *clock.Provider,
 ) ([]*Binding, error) {
 	opened := make([]*Binding, 0, len(order))
 	for _, b := range order {
@@ -478,7 +492,7 @@ func openBindings(
 		log.Info("binding listening",
 			"name", b.name,
 			"addr", b.addr.String())
-		if err := waitForListener(ctx, b.addr, 5*time.Second); err != nil {
+		if err := waitForListener(ctx, b.addr, 5*time.Second, clk); err != nil {
 			log.Error("binding readiness probe failed",
 				"name", b.name,
 				"error", err)
