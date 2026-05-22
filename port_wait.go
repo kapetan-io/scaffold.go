@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"github.com/kapetan-io/tackle/clock"
 )
 
 // waitForListener probes addr by dialing until a TCP connection succeeds,
@@ -14,9 +16,9 @@ import (
 //
 // Default timeout for scaffold call sites is 5 seconds; the parameter is
 // present for signature completeness and is not exposed or configurable.
-func waitForListener(ctx context.Context, addr net.Addr, timeout time.Duration) error {
+func waitForListener(ctx context.Context, addr net.Addr, timeout time.Duration, clk *clock.Provider) error {
 	dialAddr := translateDialAddr(addr)
-	deadline := time.Now().Add(timeout)
+	deadline := clk.Now().Add(timeout)
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -27,13 +29,13 @@ func waitForListener(ctx context.Context, addr net.Addr, timeout time.Duration) 
 			_ = conn.Close()
 			return nil
 		}
-		if time.Now().After(deadline) {
+		if clk.Now().After(deadline) {
 			return fmt.Errorf("scaffold: timed out waiting for listener at %s", addr.String())
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(10 * time.Millisecond):
+		case <-clk.After(10 * time.Millisecond):
 		}
 	}
 }
