@@ -1093,3 +1093,47 @@ func TestStartOnListenReadyCallbackRegisteredMidIteration(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, []string{"first", "second", "added_during_first"}, seq)
 }
+
+func TestStartBeforeShutdownSkippedOnOnStartError(t *testing.T) {
+	opts, _ := newTestOptions()
+	var called atomic.Bool
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				called.Store(true)
+			})
+			return errors.New("onstart fail")
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.Nil(t, inst)
+	require.Error(t, err)
+
+	assert.False(t, called.Load())
+}
+
+func TestStartBeforeShutdownSkippedOnBindFailure(t *testing.T) {
+	reserved, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	defer func() { _ = reserved.Close() }()
+	reservedPort := reserved.Addr().(*net.TCPAddr).Port
+
+	opts, _ := newTestOptions()
+	opts.Bindings = &scaffold.DefaultBindings{}
+
+	var called atomic.Bool
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				called.Store(true)
+			})
+			sc.Bindings.Add("api", reservedPort).SetMux(http.NewServeMux())
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.Nil(t, inst)
+	require.Error(t, err)
+
+	assert.False(t, called.Load())
+}
