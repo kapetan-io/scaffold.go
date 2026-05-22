@@ -393,8 +393,11 @@ A bug in a health or readiness handler cannot affect DUH-RPC endpoints — they 
 3b. OnStart returns nil  → open bindings sequentially in Add() order
     → each binding open: log "binding listening" name=<n> addr=<addr>
     → first bind failure: call OnStop → close already-opened listeners → abort
-    → all bindings succeed: log "daemon ready" → start serving
+    → all bindings succeed:
+3c. Fire AddOnListenReady callbacks in registration order
+    → log "daemon ready" → start serving
 4. SIGTERM / SIGINT / ctx cancel received → log "shutdown initiated" reason=<signal|context>
+4b. Fire AddBeforeShutdown callbacks in registration order (listeners still open)
 5. Gracefully shut down all listeners — stop accepting new connections and drain in-flight requests
    via `http.Server.Shutdown`. In Serve(): uses the OnStopTimeout context. In Start(): uses the
    context passed to Instance.Stop().

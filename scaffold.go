@@ -41,7 +41,9 @@ const (
 // Daemon is the user-implemented contract scaffold drives. OnStart runs
 // once before any binding listener is opened; OnStop runs once during the
 // shutdown sequence after all bindings have been stopped and before the
-// Cleaner executes its stack.
+// Cleaner executes its stack. AddBeforeShutdown callbacks registered during
+// OnStart run after shutdown is triggered but before any binding listener
+// begins closing.
 type Daemon interface {
 	OnStart(ctx context.Context, sc *DaemonConfig) error
 	OnStop(ctx context.Context) error
