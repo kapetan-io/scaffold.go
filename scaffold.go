@@ -313,7 +313,7 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 	bindings := resolveBindings(opts.Bindings, true)
 	cfgProv := resolveConfig(opts.ConfigProvider, log)
 	secProv := resolveConfig(opts.SecretsProvider, log)
-	clk := resolveClock(opts.Clock)
+	clk := clock.NewProvider()
 	cleaner := NewCleaner(log)
 	flag := &atomic.Bool{}
 
