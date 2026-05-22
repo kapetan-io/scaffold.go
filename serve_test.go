@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
+
 	"syscall"
 	"testing"
 	"time"
@@ -187,6 +190,85 @@ func TestServeOnStartTimeoutCancelsOnStart(t *testing.T) {
 		}
 	}
 	assert.True(t, found)
+}
+
+func TestServeOnListenReadyAndBeforeShutdownFire(t *testing.T) {
+	log, logH := newTestLogger()
+	opts := scaffold.Options{Log: log, Bindings: &scaffold.TestBindings{}}
+	var mu sync.Mutex
+	var seq []string
+	record := func(label string) {
+		mu.Lock()
+		seq = append(seq, label)
+		mu.Unlock()
+	}
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/hello", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("hi"))
+			})
+			sc.Bindings.Add("api", 0).SetMux(mux)
+			sc.AddOnListenReady(func(_ context.Context) {
+				record("listen_ready")
+			})
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				record("before_shutdown")
+			})
+			return nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runServeInBackground(t, ctx, asDaemon(f), opts)
+	waitForMessage(t, logH, "daemon ready", 5*time.Second)
+	cancel()
+
+	select {
+	case r := <-done:
+		assert.Equal(t, scaffold.ExitSuccess, r.exit)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after ctx cancel")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"listen_ready", "before_shutdown"}, seq)
+}
+
+func TestServeOnStartTimeoutCoversOnListenReadyCallbacks(t *testing.T) {
+	log, logH := newTestLogger()
+	opts := scaffold.Options{
+		Log:            log,
+		Bindings:       &scaffold.TestBindings{},
+		OnStartTimeout: 500 * time.Millisecond,
+	}
+	var deadline atomic.Value
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.Bindings.Add("api", 0).SetMux(http.NewServeMux())
+			sc.AddOnListenReady(func(ctx context.Context) {
+				if dl, ok := ctx.Deadline(); ok {
+					deadline.Store(dl)
+				}
+			})
+			return nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runServeInBackground(t, ctx, asDaemon(f), opts)
+	waitForMessage(t, logH, "daemon ready", 5*time.Second)
+	cancel()
+
+	select {
+	case r := <-done:
+		assert.Equal(t, scaffold.ExitSuccess, r.exit)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after ctx cancel")
+	}
+
+	dl, ok := deadline.Load().(time.Time)
+	require.True(t, ok)
+	assert.False(t, dl.IsZero())
 }
 
 // waitForMessage polls logH until a record with the given message is

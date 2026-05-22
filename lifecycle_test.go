@@ -1059,3 +1059,37 @@ func TestStartFullLifecycleOrdering(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, []string{"listen_ready", "before_shutdown", "on_stop", "cleaner"}, seq)
 }
+
+func TestStartOnListenReadyCallbackRegisteredMidIteration(t *testing.T) {
+	opts, _ := newTestOptions()
+	var mu sync.Mutex
+	var seq []string
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.AddOnListenReady(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "first")
+				mu.Unlock()
+				sc.AddOnListenReady(func(_ context.Context) {
+					mu.Lock()
+					seq = append(seq, "added_during_first")
+					mu.Unlock()
+				})
+			})
+			sc.AddOnListenReady(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "second")
+				mu.Unlock()
+			})
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"first", "second", "added_during_first"}, seq)
+}
