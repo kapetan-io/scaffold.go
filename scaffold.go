@@ -56,6 +56,25 @@ type DaemonConfig struct {
 	Log      *slog.Logger
 	Cleaner  *Cleaner
 	Bindings Bindings
+
+	onListenReady  []func(context.Context)
+	beforeShutdown []func(context.Context)
+}
+
+// AddOnListenReady registers fn to be called after all bindings are open and
+// dialable, before the "daemon ready" log. Callbacks are invoked in
+// registration order. Calling AddOnListenReady from within an onListenReady
+// callback is safe — the new callback will be called in the same pass.
+func (sc *DaemonConfig) AddOnListenReady(fn func(context.Context)) {
+	sc.onListenReady = append(sc.onListenReady, fn)
+}
+
+// AddBeforeShutdown registers fn to be called after shutdown is triggered but
+// before any binding listener begins closing. Callbacks are invoked in
+// registration order and only on normal shutdown paths (not OnStart errors or
+// bind failures).
+func (sc *DaemonConfig) AddBeforeShutdown(fn func(context.Context)) {
+	sc.beforeShutdown = append(sc.beforeShutdown, fn)
 }
 
 // Options configures a call to Start or Serve. All fields are optional;
@@ -170,6 +189,31 @@ func shutdownBinding(ctx context.Context, log *slog.Logger, b *Binding) (err err
 	return err
 }
 
+// runCallbacks invokes each callback in *fns in index order with per-callback
+// panic recovery. Using an index-based loop (rather than range) ensures that
+// callbacks registered mid-iteration via AddOnListenReady are visible and
+// fired in the same pass. On panic, logs at error level with the phase name,
+// "panic", and "stack" fields, then continues. fns may be nil or point to an
+// empty slice (no-op).
+func runCallbacks(ctx context.Context, log *slog.Logger, phase string, fns *[]func(context.Context)) {
+	if fns == nil {
+		return
+	}
+	for i := 0; i < len(*fns); i++ {
+		fn := (*fns)[i]
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error(phase+" callback panicked",
+						"panic", fmt.Sprint(r),
+						"stack", string(debug.Stack()))
+				}
+			}()
+			fn(ctx)
+		}()
+	}
+}
+
 // callOnStop invokes d.OnStop with panic recovery. The shutdown sequence
 // continues regardless of panic or error. Returns the OnStop error (if
 // any) for collection by runShutdown. Recovered panics do not produce a
@@ -238,6 +282,8 @@ func Start(ctx context.Context, d Daemon, opts *Options) (*Instance, error) {
 		return nil, openErr
 	}
 
+	runCallbacks(startCtx, log, "on_listen_ready", &sc.onListenReady)
+
 	log.Info("daemon ready")
 	return &Instance{
 		daemon:        d,
@@ -298,12 +344,11 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 		_ = runShutdown(enriched, log, nil, d, cleaner)
 		return ExitFailure
 	}
-	if cancelStart != nil {
-		cancelStart()
-	}
-
 	order, err := orderedFromBindings(bindings)
 	if err != nil {
+		if cancelStart != nil {
+			cancelStart()
+		}
 		log.Error("Bindings iteration failed", "error", err)
 		flag.Store(true)
 		shutdownCtx, cancel := buildShutdownCtx(opts.OnStopTimeout)
@@ -315,12 +360,20 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 
 	opened, openErr := openBindings(enrichedStart, log, order, flag)
 	if openErr != nil {
+		if cancelStart != nil {
+			cancelStart()
+		}
 		flag.Store(true)
 		shutdownCtx, cancel := buildShutdownCtx(opts.OnStopTimeout)
 		defer cancel()
 		enriched := enrichCtx(shutdownCtx, cfgProv, secProv, log)
 		_ = runShutdown(enriched, log, opened, d, cleaner)
 		return ExitFailure
+	}
+
+	runCallbacks(enrichedStart, log, "on_listen_ready", &sc.onListenReady)
+	if cancelStart != nil {
+		cancelStart()
 	}
 
 	log.Info("daemon ready")
