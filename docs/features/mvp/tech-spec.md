@@ -120,6 +120,8 @@ Default timeout is 5 seconds. Not configurable. The `ctx` passed in is the Start
 
 Port-wait runs **after** `OnStart` returns, as part of opening each binding. It is not subject to `OnStartTimeout` — that timeout bounds only `OnStart` itself. Total `Serve`/`Start` return latency from the caller's perspective is bounded by `OnStartTimeout + (5s × number of bindings)` in the worst case; in practice the probe succeeds on the first attempt after a few milliseconds.
 
+After all bindings are open and dialable, scaffold fires `AddOnListenReady` callbacks in registration order before logging "daemon ready". In `Serve()`, `cancelStart()` is deferred until after all `AddOnListenReady` callbacks return, so the `OnStartTimeout` window covers `OnStart`, `openBindings`, and all `AddOnListenReady` callbacks combined.
+
 ### Shutdown sequencing
 
 Shutdown runs strictly serially, in **reverse `Add` order** — the mirror of startup. This intentionally trades throughput for predictability: a slow binding cannot starve other bindings because there is no other binding to race against it.
@@ -130,6 +132,7 @@ Three distinct teardown paths exist, all using the same serial-reverse sequencin
 
 ```
 1. Log "shutdown initiated" with reason.
+1b. Fire AddBeforeShutdown callbacks in registration order (listeners still open).
 2. For each binding in reverse Add() order:
      - If HTTP:      http.Server.Shutdown(shutdownCtx).
      - If ServeFunc: scaffold takes no action. The user's Cleaner function

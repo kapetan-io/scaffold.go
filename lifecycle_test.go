@@ -813,3 +813,327 @@ func TestServeFuncPlusUseMiddlewarePanicsAtCallTimeFromOnStart(t *testing.T) {
 		}
 	})
 }
+
+func TestStartOnListenReadyFiresAfterListenersOpen(t *testing.T) {
+	opts, _ := newTestOptions()
+	var statusCode atomic.Int32
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/hello", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("hi"))
+			})
+			sc.Bindings.Add("api", 0).SetMux(mux)
+			sc.AddOnListenReady(func(_ context.Context) {
+				addr := sc.Bindings.Get("api").Addr()
+				resp, err := http.Get("http://" + addr.String() + "/hello")
+				if err != nil {
+					return
+				}
+				_ = resp.Body.Close()
+				statusCode.Store(int32(resp.StatusCode))
+			})
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	assert.Equal(t, int32(http.StatusOK), statusCode.Load())
+}
+
+func TestStartOnListenReadyMultipleCallbacksInRegistrationOrder(t *testing.T) {
+	opts, _ := newTestOptions()
+	var mu sync.Mutex
+	var seq []string
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.AddOnListenReady(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "first")
+				mu.Unlock()
+			})
+			sc.AddOnListenReady(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "second")
+				mu.Unlock()
+			})
+			sc.AddOnListenReady(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "third")
+				mu.Unlock()
+			})
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"first", "second", "third"}, seq)
+}
+
+func TestStartOnListenReadyPanicRecovery(t *testing.T) {
+	opts, _ := newTestOptions()
+	var mu sync.Mutex
+	var seq []string
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/hello", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("hi"))
+			})
+			sc.Bindings.Add("api", 0).SetMux(mux)
+			sc.AddOnListenReady(func(_ context.Context) {
+				panic("first callback explodes")
+			})
+			sc.AddOnListenReady(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "second")
+				mu.Unlock()
+			})
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	mu.Lock()
+	assert.Equal(t, []string{"second"}, seq)
+	mu.Unlock()
+
+	resp, err := httpGetViaDaemon(t, inst, "api", "/hello")
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestStartBeforeShutdownFiresBeforeListenersClose(t *testing.T) {
+	opts, _ := newTestOptions()
+	var addr atomic.Value
+	var statusCode atomic.Int32
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/hello", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("hi"))
+			})
+			sc.Bindings.Add("api", 0).SetMux(mux)
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				a, ok := addr.Load().(string)
+				if !ok || a == "" {
+					return
+				}
+				resp, err := http.Get("http://" + a + "/hello")
+				if err != nil {
+					return
+				}
+				_ = resp.Body.Close()
+				statusCode.Store(int32(resp.StatusCode))
+			})
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+
+	addr.Store(inst.Addr("api").String())
+	require.NoError(t, inst.Stop(context.Background()))
+
+	assert.Equal(t, int32(http.StatusOK), statusCode.Load())
+}
+
+func TestStartBeforeShutdownMultipleCallbacksInRegistrationOrder(t *testing.T) {
+	opts, _ := newTestOptions()
+	var mu sync.Mutex
+	var seq []string
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "first")
+				mu.Unlock()
+			})
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "second")
+				mu.Unlock()
+			})
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "third")
+				mu.Unlock()
+			})
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	require.NoError(t, inst.Stop(context.Background()))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"first", "second", "third"}, seq)
+}
+
+func TestStartBeforeShutdownPanicRecovery(t *testing.T) {
+	opts, _ := newTestOptions()
+	var mu sync.Mutex
+	var seq []string
+	var cleanerRan atomic.Bool
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.Cleaner.Add(func(_ context.Context) error {
+				cleanerRan.Store(true)
+				return nil
+			})
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				panic("before_shutdown explodes")
+			})
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "second")
+				mu.Unlock()
+			})
+			return nil
+		},
+		OnStop: func(_ context.Context) error {
+			mu.Lock()
+			seq = append(seq, "onstop")
+			mu.Unlock()
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NoError(t, inst.Stop(context.Background()))
+
+	mu.Lock()
+	assert.Equal(t, []string{"second", "onstop"}, seq)
+	mu.Unlock()
+	assert.True(t, cleanerRan.Load())
+}
+
+func TestStartFullLifecycleOrdering(t *testing.T) {
+	opts, _ := newTestOptions()
+	var mu sync.Mutex
+	var seq []string
+	record := func(label string) {
+		mu.Lock()
+		seq = append(seq, label)
+		mu.Unlock()
+	}
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.AddOnListenReady(func(_ context.Context) {
+				record("listen_ready")
+			})
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				record("before_shutdown")
+			})
+			sc.Cleaner.Add(func(_ context.Context) error {
+				record("cleaner")
+				return nil
+			})
+			return nil
+		},
+		OnStop: func(_ context.Context) error {
+			record("on_stop")
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NoError(t, inst.Stop(context.Background()))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"listen_ready", "before_shutdown", "on_stop", "cleaner"}, seq)
+}
+
+func TestStartOnListenReadyCallbackRegisteredMidIteration(t *testing.T) {
+	opts, _ := newTestOptions()
+	var mu sync.Mutex
+	var seq []string
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.AddOnListenReady(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "first")
+				mu.Unlock()
+				sc.AddOnListenReady(func(_ context.Context) {
+					mu.Lock()
+					seq = append(seq, "added_during_first")
+					mu.Unlock()
+				})
+			})
+			sc.AddOnListenReady(func(_ context.Context) {
+				mu.Lock()
+				seq = append(seq, "second")
+				mu.Unlock()
+			})
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"first", "second", "added_during_first"}, seq)
+}
+
+func TestStartBeforeShutdownSkippedOnOnStartError(t *testing.T) {
+	opts, _ := newTestOptions()
+	var called atomic.Bool
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				called.Store(true)
+			})
+			return errors.New("onstart fail")
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.Nil(t, inst)
+	require.Error(t, err)
+
+	assert.False(t, called.Load())
+}
+
+func TestStartBeforeShutdownSkippedOnBindFailure(t *testing.T) {
+	reserved, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	defer func() { _ = reserved.Close() }()
+	reservedPort := reserved.Addr().(*net.TCPAddr).Port
+
+	opts, _ := newTestOptions()
+	opts.Bindings = &scaffold.DefaultBindings{}
+
+	var called atomic.Bool
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.AddBeforeShutdown(func(_ context.Context) {
+				called.Store(true)
+			})
+			sc.Bindings.Add("api", reservedPort).SetMux(http.NewServeMux())
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.Nil(t, inst)
+	require.Error(t, err)
+
+	assert.False(t, called.Load())
+}

@@ -141,6 +141,14 @@ func (b *Binding) ServeFunc(fn func(net.Listener) error) {
 	b.serveFunc = fn
 }
 
+// Addr returns the address the binding is listening on. Returns nil if the
+// binding has not yet been opened (i.e., before scaffold calls openBindings
+// after OnStart returns). This is safe to call from AddOnListenReady
+// callbacks, where all bindings are guaranteed to be open.
+func (b *Binding) Addr() net.Addr {
+	return b.addr
+}
+
 // buildHandler composes the final http.Handler for this binding: the RPC
 // chain runs in registration order, falls through to the mux (or a 404
 // default) when no handler short-circuits, and is wrapped in middleware
