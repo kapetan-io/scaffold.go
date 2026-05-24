@@ -55,11 +55,13 @@ type Daemon interface {
 // daemon during OnStart. These are the same values scaffold enriches onto
 // the lifecycle context via GetConfig / GetSecrets / GetLogger.
 type DaemonConfig struct {
-	Config   ConfigProvider
-	Secrets  ConfigProvider
-	Log      *slog.Logger
-	Cleaner  *Cleaner
-	Bindings Bindings
+	Config            ConfigProvider
+	Secrets           ConfigProvider
+	Log               *slog.Logger
+	Cleaner           *Cleaner
+	Bindings          Bindings
+	BindAddress       string
+	AdvertisedAddress string
 
 	onListenReady  []func(context.Context)
 	beforeShutdown []func(context.Context)
@@ -81,16 +83,34 @@ func (sc *DaemonConfig) AddBeforeShutdown(fn func(context.Context)) {
 	sc.beforeShutdown = append(sc.beforeShutdown, fn)
 }
 
-// Options configures a call to Start or Serve. All fields are optional;
-// zero values resolve to the documented defaults (see Start / Serve).
+// Options is the platform team's contract for injecting platform concerns into
+// a scaffold daemon. The platform team populates it; the service author
+// consumes resolved values from DaemonConfig inside OnStart. All fields are
+// optional; zero values resolve to the documented defaults (see Start / Serve).
+//
+// The recommended pattern is for the platform team to export a Run function
+// that constructs Options from platform configuration and calls Serve:
+//
+//	func Run(ctx context.Context, args []string, d scaffold.Daemon) int {
+//	    return scaffold.Serve(ctx, args, d, scaffold.Options{
+//	        BindAddress:       platform.BindAddress(),
+//	        AdvertisedAddress: platform.AdvertisedAddress(),
+//	        Log:               platform.Logger(),
+//	    })
+//	}
+//
+// Service authors call the platform Run function instead of scaffold.Serve
+// directly, keeping platform concerns out of application code.
 type Options struct {
-	Bindings        Bindings
-	ConfigProvider  ConfigProvider
-	SecretsProvider ConfigProvider
-	Log             *slog.Logger
-	OnStartTimeout  time.Duration
-	OnStopTimeout   time.Duration
-	Clock           *clock.Provider
+	Bindings          Bindings
+	ConfigProvider    ConfigProvider
+	SecretsProvider   ConfigProvider
+	Log               *slog.Logger
+	BindAddress       string
+	AdvertisedAddress string
+	OnStartTimeout    time.Duration
+	OnStopTimeout     time.Duration
+	Clock             *clock.Provider
 }
 
 // Instance is the handle returned by Start. It exposes the listener
@@ -248,7 +268,22 @@ func Start(ctx context.Context, d Daemon, opts *Options) (*Instance, error) {
 		opts = &Options{}
 	}
 	log := resolveLog(opts.Log)
-	bindings := resolveBindings(opts.Bindings, false)
+
+	isTest := opts.Bindings == nil
+	if !isTest {
+		_, isTest = opts.Bindings.(*TestBindings)
+	}
+
+	bindAddr, bindSource, err := resolveBindAddress(opts.BindAddress, isTest)
+	if err != nil {
+		return nil, err
+	}
+	advAddr, advSource, err := resolveAdvertisedAddress(bindAddr, opts.AdvertisedAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	bindings := resolveBindings(opts.Bindings, false, bindAddr)
 	cfgProv := resolveConfig(opts.ConfigProvider, log)
 	secProv := resolveConfig(opts.SecretsProvider, log)
 	clk := resolveClock(opts.Clock)
@@ -256,14 +291,21 @@ func Start(ctx context.Context, d Daemon, opts *Options) (*Instance, error) {
 	flag := &atomic.Bool{}
 
 	sc := &DaemonConfig{
-		Config:   cfgProv,
-		Secrets:  secProv,
-		Log:      log,
-		Cleaner:  cleaner,
-		Bindings: bindings,
+		Config:            cfgProv,
+		Secrets:           secProv,
+		Log:               log,
+		Cleaner:           cleaner,
+		Bindings:          bindings,
+		BindAddress:       bindAddr,
+		AdvertisedAddress: advAddr,
 	}
 
 	log.Info("daemon starting")
+	log.Info("network identity resolved",
+		"bind_address", bindAddr,
+		"bind_source", bindSource,
+		"advertised_address", advAddr,
+		"advertised_source", advSource)
 	startCtx := enrichCtx(ctx, cfgProv, secProv, log)
 	if err := d.OnStart(startCtx, sc); err != nil {
 		log.Error("OnStart returned error", "error", err)
@@ -310,7 +352,25 @@ func Start(ctx context.Context, d Daemon, opts *Options) (*Instance, error) {
 func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 	_ = args
 	log := resolveLog(opts.Log)
-	bindings := resolveBindings(opts.Bindings, true)
+
+	_, isTest := opts.Bindings.(*TestBindings)
+
+	bindAddr, bindSource, err := resolveBindAddress(opts.BindAddress, isTest)
+	if err != nil {
+		log.Error("invalid bind address", "error", err)
+		return ExitFailure
+	}
+	advAddr, advSource, err := resolveAdvertisedAddress(bindAddr, opts.AdvertisedAddress)
+	if err != nil {
+		log.Error("invalid advertised address", "error", err)
+		return ExitFailure
+	}
+	if net.ParseIP(advAddr).IsLoopback() {
+		log.Warn("advertised address is loopback; peers outside this host cannot reach this service",
+			"advertised_address", advAddr)
+	}
+
+	bindings := resolveBindings(opts.Bindings, true, bindAddr)
 	cfgProv := resolveConfig(opts.ConfigProvider, log)
 	secProv := resolveConfig(opts.SecretsProvider, log)
 	clk := clock.NewProvider()
@@ -318,14 +378,21 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 	flag := &atomic.Bool{}
 
 	sc := &DaemonConfig{
-		Config:   cfgProv,
-		Secrets:  secProv,
-		Log:      log,
-		Cleaner:  cleaner,
-		Bindings: bindings,
+		Config:            cfgProv,
+		Secrets:           secProv,
+		Log:               log,
+		Cleaner:           cleaner,
+		Bindings:          bindings,
+		BindAddress:       bindAddr,
+		AdvertisedAddress: advAddr,
 	}
 
 	log.Info("daemon starting")
+	log.Info("network identity resolved",
+		"bind_address", bindAddr,
+		"bind_source", bindSource,
+		"advertised_address", advAddr,
+		"advertised_source", advSource)
 
 	startCtx := ctx
 	var cancelStart context.CancelFunc
@@ -421,13 +488,18 @@ func resolveLog(log *slog.Logger) *slog.Logger {
 }
 
 // resolveBindings returns b or a default Bindings implementation. Serve
-// defaults to DefaultBindings; Start defaults to TestBindings.
-func resolveBindings(b Bindings, production bool) Bindings {
+// defaults to DefaultBindings; Start defaults to TestBindings. When b is a
+// *DefaultBindings, bindAddr is applied so the caller's address selection is
+// honoured even when the caller constructed the DefaultBindings directly.
+func resolveBindings(b Bindings, production bool, bindAddr string) Bindings {
 	if b != nil {
+		if db, ok := b.(*DefaultBindings); ok {
+			db.bindAddr = bindAddr
+		}
 		return b
 	}
 	if production {
-		return &DefaultBindings{}
+		return &DefaultBindings{bindAddr: bindAddr}
 	}
 	return &TestBindings{}
 }

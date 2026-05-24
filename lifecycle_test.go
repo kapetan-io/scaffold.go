@@ -1165,3 +1165,186 @@ func TestStartUsesInjectedClock(t *testing.T) {
 
 	require.NoError(t, inst.Stop(context.Background()))
 }
+
+func TestStartBindAddressThreading(t *testing.T) {
+	opts, _ := newTestOptions()
+	opts.BindAddress = "127.0.0.1"
+	opts.Bindings = &scaffold.DefaultBindings{}
+
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.Bindings.Add("api", 0).SetMux(http.NewServeMux())
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	addr := inst.Addr("api").(*net.TCPAddr)
+	assert.Equal(t, "127.0.0.1", addr.IP.String())
+}
+
+func TestStartBindAddressIPv6(t *testing.T) {
+	opts, _ := newTestOptions()
+	opts.BindAddress = "::1"
+	opts.Bindings = &scaffold.DefaultBindings{}
+
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.Bindings.Add("api", 0).SetMux(http.NewServeMux())
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	addr := inst.Addr("api").(*net.TCPAddr)
+	assert.Equal(t, "::1", addr.IP.String())
+}
+
+func TestStartDaemonConfigDefaultTestBindings(t *testing.T) {
+	opts, _ := newTestOptions()
+	// No Bindings and no BindAddress — defaults to 127.0.0.1 (isTest=true).
+
+	var bindAddr, advAddr string
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			bindAddr = sc.BindAddress
+			advAddr = sc.AdvertisedAddress
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	assert.Equal(t, "127.0.0.1", bindAddr)
+	assert.Equal(t, "127.0.0.1", advAddr)
+}
+
+func TestStartDaemonConfigExplicitBindAddress(t *testing.T) {
+	opts, _ := newTestOptions()
+	opts.BindAddress = "127.0.0.1"
+	opts.Bindings = &scaffold.DefaultBindings{}
+
+	var bindAddr, advAddr string
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			bindAddr = sc.BindAddress
+			advAddr = sc.AdvertisedAddress
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	assert.Equal(t, "127.0.0.1", bindAddr)
+	assert.Equal(t, "127.0.0.1", advAddr)
+}
+
+func TestStartDaemonConfigExplicitAdvertisedAddress(t *testing.T) {
+	opts, _ := newTestOptions()
+	opts.AdvertisedAddress = "10.0.0.99"
+
+	var advAddr string
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			advAddr = sc.AdvertisedAddress
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	assert.Equal(t, "10.0.0.99", advAddr)
+}
+
+func TestStartInvalidBindAddressReturnsError(t *testing.T) {
+	opts, _ := newTestOptions()
+	opts.BindAddress = "not-an-ip"
+
+	f := &fakeDaemon{}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.Nil(t, inst)
+	require.ErrorContains(t, err, "invalid BindAddress")
+	assert.NotContains(t, f.Events(), "onstart")
+}
+
+func TestStartInvalidAdvertisedAddressReturnsError(t *testing.T) {
+	opts, _ := newTestOptions()
+	opts.AdvertisedAddress = "not-an-ip"
+
+	f := &fakeDaemon{}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.Nil(t, inst)
+	require.ErrorContains(t, err, "invalid AdvertisedAddress")
+	assert.NotContains(t, f.Events(), "onstart")
+}
+
+func TestStartNilOptionsWithAddressResolution(t *testing.T) {
+	var bindAddr string
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			bindAddr = sc.BindAddress
+			return nil
+		},
+	}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), nil)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	assert.Equal(t, "127.0.0.1", bindAddr)
+}
+
+func TestStartNetworkIdentityLogLine(t *testing.T) {
+	opts, logH := newTestOptions()
+	opts.BindAddress = "127.0.0.1"
+	opts.Bindings = &scaffold.DefaultBindings{}
+
+	f := &fakeDaemon{}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	rec := logH.findByMessage("network identity resolved")
+	require.NotNil(t, rec)
+
+	bindAddr, ok := recordAttr(*rec, "bind_address")
+	require.True(t, ok)
+	assert.Equal(t, "127.0.0.1", bindAddr.Value.String())
+
+	bindSource, ok := recordAttr(*rec, "bind_source")
+	require.True(t, ok)
+	assert.Equal(t, "configured", bindSource.Value.String())
+
+	advAddr, ok := recordAttr(*rec, "advertised_address")
+	require.True(t, ok)
+	assert.Equal(t, "127.0.0.1", advAddr.Value.String())
+
+	advSource, ok := recordAttr(*rec, "advertised_source")
+	require.True(t, ok)
+	assert.Equal(t, "derived", advSource.Value.String())
+
+	// Verify "network identity resolved" appears after "daemon starting" in log sequence.
+	var startingIdx, identityIdx int
+	for i, r := range logH.Records() {
+		if r.Message == "daemon starting" {
+			startingIdx = i
+		}
+		if r.Message == "network identity resolved" {
+			identityIdx = i
+		}
+	}
+	assert.Greater(t, identityIdx, startingIdx)
+}

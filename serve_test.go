@@ -271,6 +271,119 @@ func TestServeOnStartTimeoutCoversOnListenReadyCallbacks(t *testing.T) {
 	assert.False(t, dl.IsZero())
 }
 
+func TestServeInvalidBindAddressReturnsExitFailure(t *testing.T) {
+	log, _ := newTestLogger()
+	opts := scaffold.Options{Log: log, BindAddress: "not-an-ip"}
+	f := &fakeDaemon{}
+
+	exit := scaffold.Serve(context.Background(), nil, asDaemon(f), opts)
+	assert.Equal(t, scaffold.ExitFailure, exit)
+	assert.NotContains(t, f.Events(), "onstart")
+}
+
+func TestServeInvalidAdvertisedAddressReturnsExitFailure(t *testing.T) {
+	log, _ := newTestLogger()
+	opts := scaffold.Options{Log: log, AdvertisedAddress: "not-an-ip"}
+	f := &fakeDaemon{}
+
+	exit := scaffold.Serve(context.Background(), nil, asDaemon(f), opts)
+	assert.Equal(t, scaffold.ExitFailure, exit)
+	assert.NotContains(t, f.Events(), "onstart")
+}
+
+func TestServeNetworkIdentityLogLine(t *testing.T) {
+	log, logH := newTestLogger()
+	opts := scaffold.Options{
+		Log:         log,
+		Bindings:    &scaffold.TestBindings{},
+		BindAddress: "127.0.0.1",
+	}
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.Bindings.Add("api", 0).SetMux(http.NewServeMux())
+			return nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runServeInBackground(t, ctx, asDaemon(f), opts)
+
+	waitForMessage(t, logH, "daemon ready", 5*time.Second)
+	cancel()
+
+	select {
+	case r := <-done:
+		assert.Equal(t, scaffold.ExitSuccess, r.exit)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after ctx cancel")
+	}
+
+	rec := logH.findByMessage("network identity resolved")
+	require.NotNil(t, rec)
+
+	bindAddr, ok := recordAttr(*rec, "bind_address")
+	require.True(t, ok)
+	assert.Equal(t, "127.0.0.1", bindAddr.Value.String())
+
+	bindSource, ok := recordAttr(*rec, "bind_source")
+	require.True(t, ok)
+	assert.Equal(t, "configured", bindSource.Value.String())
+
+	advAddr, ok := recordAttr(*rec, "advertised_address")
+	require.True(t, ok)
+	assert.Equal(t, "127.0.0.1", advAddr.Value.String())
+
+	advSource, ok := recordAttr(*rec, "advertised_source")
+	require.True(t, ok)
+	assert.Equal(t, "derived", advSource.Value.String())
+
+	// Verify "network identity resolved" appears after "daemon starting" in log sequence.
+	var startingIdx, identityIdx int
+	for i, r := range logH.Records() {
+		if r.Message == "daemon starting" {
+			startingIdx = i
+		}
+		if r.Message == "network identity resolved" {
+			identityIdx = i
+		}
+	}
+	assert.Greater(t, identityIdx, startingIdx)
+}
+
+func TestServeLoopbackWarning(t *testing.T) {
+	log, logH := newTestLogger()
+	opts := scaffold.Options{
+		Log:         log,
+		Bindings:    &scaffold.TestBindings{},
+		BindAddress: "127.0.0.1",
+	}
+	f := &fakeDaemon{
+		OnStart: func(_ context.Context, sc *scaffold.DaemonConfig) error {
+			sc.Bindings.Add("api", 0).SetMux(http.NewServeMux())
+			return nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runServeInBackground(t, ctx, asDaemon(f), opts)
+
+	waitForMessage(t, logH, "daemon ready", 5*time.Second)
+	cancel()
+
+	select {
+	case r := <-done:
+		assert.Equal(t, scaffold.ExitSuccess, r.exit)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after ctx cancel")
+	}
+
+	rec := logH.findByMessage("advertised address is loopback; peers outside this host cannot reach this service")
+	require.NotNil(t, rec)
+
+	advAddr, ok := recordAttr(*rec, "advertised_address")
+	require.True(t, ok)
+	assert.Equal(t, "127.0.0.1", advAddr.Value.String())
+	assert.Equal(t, slog.LevelWarn, rec.Level)
+}
+
 // waitForMessage polls logH until a record with the given message is
 // captured or timeout expires.
 func waitForMessage(t *testing.T, logH *testLogHandler, msg string, timeout time.Duration) {

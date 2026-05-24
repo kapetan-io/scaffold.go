@@ -2,6 +2,7 @@ package scaffold
 
 import (
 	"fmt"
+	"net"
 	"sync"
 )
 
@@ -75,15 +76,17 @@ func (s *bindingStore) orderedBindings() []*Binding {
 }
 
 // DefaultBindings is the production Bindings implementation. Each
-// registered binding listens on :<port> (all interfaces).
+// registered binding listens on bindAddr:port (or all interfaces when
+// bindAddr is empty or a wildcard like "0.0.0.0").
 type DefaultBindings struct {
 	bindingStore
+	bindAddr string
 }
 
-// Add registers a new binding under name that will listen on :port when the
-// daemon starts. Panics if name is already registered.
+// Add registers a new binding under name that will listen on bindAddr:port
+// when the daemon starts. Panics if name is already registered.
 func (d *DefaultBindings) Add(name string, port int) *Binding {
-	return d.add(name, fmt.Sprintf(":%d", port))
+	return d.add(name, net.JoinHostPort(d.bindAddr, fmt.Sprintf("%d", port)))
 }
 
 // TestBindings is the test-oriented Bindings implementation. Every
