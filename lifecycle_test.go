@@ -1305,3 +1305,46 @@ func TestStartNilOptionsWithAddressResolution(t *testing.T) {
 
 	assert.Equal(t, "127.0.0.1", bindAddr)
 }
+
+func TestStartNetworkIdentityLogLine(t *testing.T) {
+	opts, logH := newTestOptions()
+	opts.BindAddress = "127.0.0.1"
+	opts.Bindings = &scaffold.DefaultBindings{}
+
+	f := &fakeDaemon{}
+	inst, err := scaffold.Start(context.Background(), asDaemon(f), &opts)
+	require.NoError(t, err)
+	require.NotNil(t, inst)
+	defer func() { _ = inst.Stop(context.Background()) }()
+
+	rec := logH.findByMessage("network identity resolved")
+	require.NotNil(t, rec)
+
+	bindAddr, ok := recordAttr(*rec, "bind_address")
+	require.True(t, ok)
+	assert.Equal(t, "127.0.0.1", bindAddr.Value.String())
+
+	bindSource, ok := recordAttr(*rec, "bind_source")
+	require.True(t, ok)
+	assert.Equal(t, "configured", bindSource.Value.String())
+
+	advAddr, ok := recordAttr(*rec, "advertised_address")
+	require.True(t, ok)
+	assert.Equal(t, "127.0.0.1", advAddr.Value.String())
+
+	advSource, ok := recordAttr(*rec, "advertised_source")
+	require.True(t, ok)
+	assert.Equal(t, "derived", advSource.Value.String())
+
+	// Verify "network identity resolved" appears after "daemon starting" in log sequence.
+	var startingIdx, identityIdx int
+	for i, r := range logH.Records() {
+		if r.Message == "daemon starting" {
+			startingIdx = i
+		}
+		if r.Message == "network identity resolved" {
+			identityIdx = i
+		}
+	}
+	assert.Greater(t, identityIdx, startingIdx)
+}

@@ -83,8 +83,24 @@ func (sc *DaemonConfig) AddBeforeShutdown(fn func(context.Context)) {
 	sc.beforeShutdown = append(sc.beforeShutdown, fn)
 }
 
-// Options configures a call to Start or Serve. All fields are optional;
-// zero values resolve to the documented defaults (see Start / Serve).
+// Options is the platform team's contract for injecting platform concerns into
+// a scaffold daemon. The platform team populates it; the service author
+// consumes resolved values from DaemonConfig inside OnStart. All fields are
+// optional; zero values resolve to the documented defaults (see Start / Serve).
+//
+// The recommended pattern is for the platform team to export a Run function
+// that constructs Options from platform configuration and calls Serve:
+//
+//	func Run(ctx context.Context, args []string, d scaffold.Daemon) int {
+//	    return scaffold.Serve(ctx, args, d, scaffold.Options{
+//	        BindAddress:       platform.BindAddress(),
+//	        AdvertisedAddress: platform.AdvertisedAddress(),
+//	        Log:               platform.Logger(),
+//	    })
+//	}
+//
+// Service authors call the platform Run function instead of scaffold.Serve
+// directly, keeping platform concerns out of application code.
 type Options struct {
 	Bindings          Bindings
 	ConfigProvider    ConfigProvider
