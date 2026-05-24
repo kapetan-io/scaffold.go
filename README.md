@@ -73,6 +73,250 @@ SIGTERM / SIGINT / caller context cancellation, and then drains in-flight
 requests, calls `OnStop`, and runs any teardown registered with
 `sc.Cleaner.Add`. All three steps share a single `OnStopTimeout` budget.
 
+## Lifecycle
+
+Scaffold runs a daemon through a deterministic sequence. Every step happens
+in order; failures at any point trigger a partial shutdown that tears down
+only what was already set up.
+
+```
+Options resolved (address, logger, config, bindings)
+    │
+    ▼
+OnStart(ctx, DaemonConfig)          ◄─ register bindings, middleware, handlers
+    │
+    ▼
+Listeners opened (Add order)        ◄─ net.Listen on each binding
+    │
+    ▼
+OnListenReady callbacks             ◄─ all ports are dialable
+    │
+    ▼
+"daemon ready" log
+    │
+    ▼
+Blocking (Serve: signals/ctx)       ◄─ Start: returns *Instance immediately
+    │
+    ▼
+BeforeShutdown callbacks            ◄─ listeners still open
+    │
+    ▼
+Listeners closed (reverse order)    ◄─ graceful drain via http.Server.Shutdown
+    │
+    ▼
+OnStop(ctx)
+    │
+    ▼
+Cleaner runs (LIFO)
+    │
+    ▼
+"daemon stopped" log
+```
+
+### `Start` vs `Serve`
+
+| | `Start` | `Serve` |
+|---|---|---|
+| Signal handling | No | SIGTERM, SIGINT |
+| Timeouts | No | `OnStartTimeout`, `OnStopTimeout` |
+| Default bindings | `TestBindings` (127.0.0.1:0) | `DefaultBindings` (BindAddress:port) |
+| Returns | `(*Instance, error)` | `int` (exit code) |
+| Blocking | Returns immediately | Blocks until signal or ctx cancel |
+
+Use `Start` in tests and embedding scenarios. Use `Serve` in `main()`.
+
+### Lifecycle Callbacks
+
+Register callbacks during `OnStart` to hook into specific lifecycle moments:
+
+```go
+func (d *Daemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
+    sc.AddOnListenReady(func(ctx context.Context) {
+        // All ports are open and dialable. Register with service discovery,
+        // start background workers, or flip readiness to true.
+    })
+
+    sc.AddBeforeShutdown(func(ctx context.Context) {
+        // Shutdown was triggered but listeners are still open.
+        // Deregister from service discovery, drain queues, or
+        // send "going away" to peers while they can still reach you.
+    })
+
+    // ...
+    return nil
+}
+```
+
+`OnListenReady` fires after all binding listeners are open and dialable,
+before the "daemon ready" log. `BeforeShutdown` fires after shutdown is
+triggered but before any listener begins closing — only on normal shutdown
+paths (not OnStart errors or bind failures).
+
+## Bindings
+
+A binding is a named network listener with its own middleware stack and
+handler. Register bindings during `OnStart`:
+
+```go
+func (d *Daemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
+    api := sc.Bindings.Add("api", 8080)
+    api.UseMiddleware(scaffold.PanicRecovery(sc.Log))
+    api.SetTimeouts(10*time.Second, 30*time.Second, 120*time.Second)
+
+    mux := http.NewServeMux()
+    mux.HandleFunc("/hello", helloHandler)
+    api.SetMux(mux)
+
+    return nil
+}
+```
+
+`Add` registers a binding with a port hint. In production (`Serve`), the
+binding listens on `BindAddress:port`. In tests (`Start` with nil bindings),
+`TestBindings` ignores the port and assigns a random port on `127.0.0.1`.
+After startup, read the actual address via `inst.Addr("api")`.
+
+Bindings open in Add order and close in reverse order during shutdown. This
+guarantees that dependencies registered later shut down first.
+
+### RPC Handlers
+
+For services using RPC frameworks (gRPC, DUH-RPC), bindings support an RPC
+handler chain that runs before the mux:
+
+```go
+api.AddRPC(v1.NewPaymentServer(svc), v1.NewAccountServer(svc))
+api.SetMux(fallbackMux) // handles requests no RPC handler claimed
+```
+
+Each `RPCHandler` returns `true` to claim the request or `false` to pass it
+down the chain. The mux is the final fallback.
+
+### ServeFunc
+
+For non-HTTP protocols (gRPC with its own server, custom TCP), use
+`ServeFunc` to take ownership of the raw listener:
+
+```go
+grpcBinding := sc.Bindings.Add("grpc", 9090)
+grpcServer := grpc.NewServer()
+grpcBinding.ServeFunc(func(ln net.Listener) error {
+    return grpcServer.Serve(ln)
+})
+sc.Cleaner.Add(func(ctx context.Context) error {
+    grpcServer.GracefulStop()
+    return nil
+})
+```
+
+When using `ServeFunc`, the caller is responsible for graceful shutdown via
+the Cleaner.
+
+## Network Identity
+
+Scaffold gives every daemon a network identity: a `BindAddress` that all
+bindings listen on and an `AdvertisedAddress` that services use for peer
+communication and service registration.
+
+```go
+scaffold.Options{
+    BindAddress:       "10.0.1.5",   // listen on this interface
+    AdvertisedAddress: "203.0.113.1", // tell peers to reach me here
+}
+```
+
+Both are resolved before `OnStart` and exposed on `DaemonConfig`:
+
+```go
+func (d *Daemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
+    // Register with Consul using the resolved advertised address
+    consul.Register(sc.AdvertisedAddress, sc.Bindings.Get("api").Addr())
+    return nil
+}
+```
+
+### Defaults
+
+| Scenario | `BindAddress` | `AdvertisedAddress` |
+|---|---|---|
+| Zero config (Serve) | `0.0.0.0` | Auto-detected private IP |
+| Zero config (Start/tests) | `127.0.0.1` | `127.0.0.1` |
+| Explicit bind, no advertised | Configured value | Same as bind address |
+| Both explicit | Configured value | Configured value |
+
+Auto-detection picks the first non-loopback, non-link-local, private IP
+from the system's network interfaces — the same heuristic used by HashiCorp
+Consul and Nomad.
+
+### Kubernetes Example
+
+```yaml
+env:
+  - name: BIND_ADDR
+    valueFrom:
+      fieldRef:
+        fieldPath: status.podIP
+```
+
+```go
+scaffold.Options{
+    BindAddress: os.Getenv("BIND_ADDR"),
+    // AdvertisedAddress derived from BindAddress automatically
+}
+```
+
+## Config and Secrets
+
+Scaffold provides two `ConfigProvider` slots — one for application config,
+one for secrets — so sensitive values stay separate from general configuration.
+
+```go
+scaffold.Options{
+    ConfigProvider:  &scaffold.EnvConfigProvider{Logger: log},
+    SecretsProvider: &scaffold.FileConfigProvider{Dir: "/run/secrets", Logger: log},
+}
+```
+
+Service authors consume them from `DaemonConfig`:
+
+```go
+func (d *Daemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
+    dbURL := sc.Config.StringOr("DATABASE_URL", "postgres://localhost:5432/mydb")
+    apiKey, err := sc.Secrets.String("API_KEY")
+    // ...
+}
+```
+
+Three built-in providers:
+
+- **`EnvConfigProvider`** — reads from environment variables on every call.
+- **`FileConfigProvider`** — reads from `{Dir}/{key}` files; designed for
+  Kubernetes ConfigMap and Secret volume mounts.
+- **`MapConfigProvider`** — in-memory map; useful in tests.
+
+Every provider supports typed accessors (`String`, `Int`, `Float64`, `Bool`,
+`Duration`) and fallback variants (`StringOr`, `IntOr`, etc.) that return a
+default on missing keys.
+
+## Cleaner
+
+`DaemonConfig.Cleaner` is a LIFO cleanup stack. Register teardown functions
+during `OnStart`; they run automatically after `OnStop` in reverse order.
+
+```go
+func (d *Daemon) OnStart(ctx context.Context, sc *scaffold.DaemonConfig) error {
+    db, err := sql.Open("postgres", sc.Config.StringOr("DATABASE_URL", "..."))
+    if err != nil {
+        return err
+    }
+    sc.Cleaner.Add(func(ctx context.Context) error {
+        return db.Close()
+    })
+    // db is guaranteed to be closed during shutdown, even if OnStop panics
+    return nil
+}
+```
+
 ## Surface Testing
 
 Scaffold ships a parallel `Start` entry point so tests exercise the same
@@ -110,19 +354,44 @@ struct — a fake store replaces Mongo, a fake S3 client replaces S3. See
 
 ## Platform-Specific Scaffolds
 
-`scaffold.DaemonConfig` is a plain exported struct passed as a pointer.
-Platform teams can build a company-standard base layer on top of scaffold
-without forking it — company middleware, binding conventions, and admin
-ports are applied once in the wrapper; individual services implement a
-thinner company interface and get the wiring for free.
+`Options` is the platform team's contract for injecting platform concerns.
+The recommended pattern is for the platform team to export a `Run` function
+that constructs `Options` from platform configuration and calls `Serve`:
 
 ```go
 package mycompany
 
+func Run(ctx context.Context, args []string, d scaffold.Daemon) int {
+    return scaffold.Serve(ctx, args, mycompany.New(d), scaffold.Options{
+        BindAddress:       platform.BindAddress(),
+        AdvertisedAddress: platform.AdvertisedAddress(),
+        Log:               platform.Logger(),
+        ConfigProvider:    platform.Config(),
+        SecretsProvider:   platform.Secrets(),
+    })
+}
+```
+
+Service authors call the platform `Run` function and never touch `Options`
+directly:
+
+```go
+func main() {
+    os.Exit(mycompany.Run(context.Background(), os.Args, &paymentsvc.Daemon{}))
+}
+```
+
+`DaemonConfig` is a plain exported struct passed as a pointer. Platform
+teams can build a company-standard base layer on top of scaffold without
+forking it — company middleware, binding conventions, and admin ports are
+applied once in the wrapper; individual services implement a thinner company
+interface and get the wiring for free.
+
+```go
 type CompanyConfig struct {
     *scaffold.DaemonConfig
-    APIBinding   *scaffold.Binding // pre-configured with company middleware
-    AdminBinding *scaffold.Binding // metrics, healthz, readyz mounted
+    APIBinding   *scaffold.Binding
+    AdminBinding *scaffold.Binding
 }
 
 type Daemon interface {
@@ -166,13 +435,6 @@ func (s *Daemon) OnStart(ctx context.Context, cc *mycompany.CompanyConfig) error
     cc.APIBinding.AddRPC(v1.NewServer(s.svc))
     return nil
 }
-```
-
-`main.go` is the usual `scaffold.Serve` call, wrapping the service with the
-company base layer:
-
-```go
-os.Exit(scaffold.Serve(ctx, os.Args, mycompany.New(&paymentsvc.Daemon{}), scaffold.Options{}))
 ```
 
 Because `DaemonConfig` is a struct (not an interface) and `Bindings.Get`
