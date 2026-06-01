@@ -1,4 +1,4 @@
-module github.com/kapetan-io/scaffold
+module github.com/kapetan-io/scaffold.go
 
 go 1.26
 

@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/kapetan-io/scaffold"
+	"github.com/kapetan-io/scaffold.go"
 	"github.com/stretchr/testify/assert"
 )
 

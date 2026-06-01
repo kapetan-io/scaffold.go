@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/kapetan-io/scaffold"
+	"github.com/kapetan-io/scaffold.go"
 )
 
 // exampleDaemon is a minimal service that exposes a single /hello endpoint on

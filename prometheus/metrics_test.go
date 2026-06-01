@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	sprometheus "github.com/kapetan-io/scaffold/prometheus"
+	sprometheus "github.com/kapetan-io/scaffold.go/prometheus"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"

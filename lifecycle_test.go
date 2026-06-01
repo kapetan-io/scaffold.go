@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kapetan-io/scaffold"
+	"github.com/kapetan-io/scaffold.go"
 	"github.com/kapetan-io/tackle/autotls"
 	"github.com/kapetan-io/tackle/clock"
 	"github.com/stretchr/testify/assert"

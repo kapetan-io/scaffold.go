@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/kapetan-io/scaffold"
+	"github.com/kapetan-io/scaffold.go"
 )
 
 // testLogHandlerCore holds the shared state for a testLogHandler; values of

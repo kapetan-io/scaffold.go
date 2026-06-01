@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	sprometheus "github.com/kapetan-io/scaffold/prometheus"
+	sprometheus "github.com/kapetan-io/scaffold.go/prometheus"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

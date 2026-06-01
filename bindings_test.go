@@ -3,7 +3,7 @@ package scaffold_test
 import (
 	"testing"
 
-	"github.com/kapetan-io/scaffold"
+	"github.com/kapetan-io/scaffold.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
