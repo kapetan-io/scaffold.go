@@ -75,3 +75,13 @@ func (w *panicTrackingWriter) Write(b []byte) (int, error) {
 func (w *panicTrackingWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
+
+// Flush implements http.Flusher by delegating to the underlying writer if it
+// supports flushing. This allows streaming handlers (e.g. duh.HandleStream)
+// that type-assert for http.Flusher to work correctly when PanicRecovery is
+// in the middleware chain.
+func (w *panicTrackingWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
