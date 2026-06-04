@@ -1,7 +1,7 @@
 # Scaffold
 
-[![GitHub tag](https://img.shields.io/github/tag/kapetan-io/scaffold?include_prereleases=&sort=semver&color=blue)](https://github.com/kapetan-io/scaffold/releases/)
-[![CI](https://github.com/kapetan-io/scaffold/workflows/CI/badge.svg)](https://github.com/kapetan-io/scaffold/actions?query=workflow:"CI")
+[![GitHub tag](https://img.shields.io/github/tag/kapetan-io/scaffold.go?include_prereleases=&sort=semver&color=blue)](https://github.com/kapetan-io/scaffold/releases/)
+[![CI](https://github.com/kapetan-io/scaffold.go/workflows/CI/badge.svg)](https://github.com/kapetan-io/scaffold/actions?query=workflow:"CI")
 [![License](https://img.shields.io/badge/License-Apache-blue)](#license)
 
 Scaffold is a Go framework for building HTTP API services. It owns the
