@@ -1317,7 +1317,7 @@ func TestStartNetworkIdentityLogLine(t *testing.T) {
 	require.NotNil(t, inst)
 	defer func() { _ = inst.Stop(context.Background()) }()
 
-	rec := logH.findByMessage("network identity resolved")
+	rec := logH.findByMessage("daemon starting")
 	require.NotNil(t, rec)
 
 	bindAddr, ok := recordAttr(*rec, "bind_address")
@@ -1335,16 +1335,4 @@ func TestStartNetworkIdentityLogLine(t *testing.T) {
 	advSource, ok := recordAttr(*rec, "advertised_source")
 	require.True(t, ok)
 	assert.Equal(t, "derived", advSource.Value.String())
-
-	// Verify "network identity resolved" appears after "daemon starting" in log sequence.
-	var startingIdx, identityIdx int
-	for i, r := range logH.Records() {
-		if r.Message == "daemon starting" {
-			startingIdx = i
-		}
-		if r.Message == "network identity resolved" {
-			identityIdx = i
-		}
-	}
-	assert.Greater(t, identityIdx, startingIdx)
 }

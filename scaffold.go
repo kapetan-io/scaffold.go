@@ -302,8 +302,7 @@ func Start(ctx context.Context, d Daemon, opts *Options) (*Instance, error) {
 		AdvertisedAddress: advAddr,
 	}
 
-	fw.Info("daemon starting")
-	fw.Info("network identity resolved",
+	fw.Info("daemon starting",
 		"bind_address", bindAddr,
 		"bind_source", bindSource,
 		"advertised_address", advAddr,
@@ -391,8 +390,7 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 		AdvertisedAddress: advAddr,
 	}
 
-	fw.Info("daemon starting")
-	fw.Info("network identity resolved",
+	fw.Info("daemon starting",
 		"bind_address", bindAddr,
 		"bind_source", bindSource,
 		"advertised_address", advAddr,
