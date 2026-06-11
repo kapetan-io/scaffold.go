@@ -119,6 +119,7 @@ type Options struct {
 type Instance struct {
 	daemon        Daemon
 	sc            *DaemonConfig
+	fw            *slog.Logger
 	bindingsOrder []*Binding
 	shutdownFlag  *atomic.Bool
 	once          sync.Once
@@ -146,9 +147,9 @@ func (i *Instance) Stop(ctx context.Context) error {
 	i.once.Do(func() {
 		i.shutdownFlag.Store(true)
 		enriched := enrichCtx(ctx, i.sc.Config, i.sc.Secrets, i.sc.Log)
-		i.sc.Log.Info("shutdown initiated", "reason", reasonInstanceStop)
-		err = runShutdown(enriched, i.sc.Log, &i.sc.beforeShutdown, i.bindingsOrder, i.daemon, i.sc.Cleaner)
-		i.sc.Log.Info("daemon stopped")
+		i.fw.Info("shutdown initiated", "reason", reasonInstanceStop)
+		err = runShutdown(enriched, i.fw, &i.sc.beforeShutdown, i.bindingsOrder, i.daemon, i.sc.Cleaner)
+		i.fw.Info("daemon stopped")
 	})
 	return err
 }
@@ -267,7 +268,8 @@ func Start(ctx context.Context, d Daemon, opts *Options) (*Instance, error) {
 	if opts == nil {
 		opts = &Options{}
 	}
-	log := resolveLog(opts.Log)
+	base := resolveLog(opts.Log)           // untagged — handed downstream to the service
+	fw := base.With("library", "scaffold") // framework's own lifecycle lines
 
 	isTest := opts.Bindings == nil
 	if !isTest {
@@ -284,56 +286,56 @@ func Start(ctx context.Context, d Daemon, opts *Options) (*Instance, error) {
 	}
 
 	bindings := resolveBindings(opts.Bindings, false, bindAddr)
-	cfgProv := resolveConfig(opts.ConfigProvider, log)
-	secProv := resolveConfig(opts.SecretsProvider, log)
+	cfgProv := resolveConfig(opts.ConfigProvider, fw)
+	secProv := resolveConfig(opts.SecretsProvider, fw)
 	clk := resolveClock(opts.Clock)
-	cleaner := NewCleaner(log)
+	cleaner := NewCleaner(fw)
 	flag := &atomic.Bool{}
 
 	sc := &DaemonConfig{
 		Config:            cfgProv,
 		Secrets:           secProv,
-		Log:               log,
+		Log:               base,
 		Cleaner:           cleaner,
 		Bindings:          bindings,
 		BindAddress:       bindAddr,
 		AdvertisedAddress: advAddr,
 	}
 
-	log.Info("daemon starting")
-	log.Info("network identity resolved",
+	fw.Info("daemon starting",
 		"bind_address", bindAddr,
 		"bind_source", bindSource,
 		"advertised_address", advAddr,
 		"advertised_source", advSource)
-	startCtx := enrichCtx(ctx, cfgProv, secProv, log)
+	startCtx := enrichCtx(ctx, cfgProv, secProv, base)
 	if err := d.OnStart(startCtx, sc); err != nil {
-		log.Error("OnStart returned error", "error", err)
+		fw.Error("OnStart returned error", "error", err)
 		flag.Store(true)
-		_ = runShutdown(startCtx, log, nil, nil, d, cleaner)
+		_ = runShutdown(startCtx, fw, nil, nil, d, cleaner)
 		return nil, err
 	}
 
 	order, err := orderedFromBindings(bindings)
 	if err != nil {
 		flag.Store(true)
-		_ = runShutdown(startCtx, log, nil, nil, d, cleaner)
+		_ = runShutdown(startCtx, fw, nil, nil, d, cleaner)
 		return nil, err
 	}
 
-	opened, openErr := openBindings(startCtx, log, order, flag, clk)
+	opened, openErr := openBindings(startCtx, fw, order, flag, clk)
 	if openErr != nil {
 		flag.Store(true)
-		_ = runShutdown(startCtx, log, nil, opened, d, cleaner)
+		_ = runShutdown(startCtx, fw, nil, opened, d, cleaner)
 		return nil, openErr
 	}
 
-	runCallbacks(startCtx, log, "on_listen_ready", &sc.onListenReady)
+	runCallbacks(startCtx, fw, "on_listen_ready", &sc.onListenReady)
 
-	log.Info("daemon ready")
+	fw.Info("daemon ready")
 	return &Instance{
 		daemon:        d,
 		sc:            sc,
+		fw:            fw,
 		bindingsOrder: order,
 		shutdownFlag:  flag,
 	}, nil
@@ -351,44 +353,44 @@ func Start(ctx context.Context, d Daemon, opts *Options) (*Instance, error) {
 // ignored in v1.
 func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 	_ = args
-	log := resolveLog(opts.Log)
+	base := resolveLog(opts.Log)           // untagged — handed downstream to the service
+	fw := base.With("library", "scaffold") // framework's own lifecycle lines
 
 	_, isTest := opts.Bindings.(*TestBindings)
 
 	bindAddr, bindSource, err := resolveBindAddress(opts.BindAddress, isTest)
 	if err != nil {
-		log.Error("invalid bind address", "error", err)
+		fw.Error("invalid bind address", "error", err)
 		return ExitFailure
 	}
 	advAddr, advSource, err := resolveAdvertisedAddress(bindAddr, opts.AdvertisedAddress)
 	if err != nil {
-		log.Error("invalid advertised address", "error", err)
+		fw.Error("invalid advertised address", "error", err)
 		return ExitFailure
 	}
 	if net.ParseIP(advAddr).IsLoopback() {
-		log.Warn("advertised address is loopback; peers outside this host cannot reach this service",
+		fw.Warn("advertised address is loopback; peers outside this host cannot reach this service",
 			"advertised_address", advAddr)
 	}
 
 	bindings := resolveBindings(opts.Bindings, true, bindAddr)
-	cfgProv := resolveConfig(opts.ConfigProvider, log)
-	secProv := resolveConfig(opts.SecretsProvider, log)
+	cfgProv := resolveConfig(opts.ConfigProvider, fw)
+	secProv := resolveConfig(opts.SecretsProvider, fw)
 	clk := clock.NewProvider()
-	cleaner := NewCleaner(log)
+	cleaner := NewCleaner(fw)
 	flag := &atomic.Bool{}
 
 	sc := &DaemonConfig{
 		Config:            cfgProv,
 		Secrets:           secProv,
-		Log:               log,
+		Log:               base,
 		Cleaner:           cleaner,
 		Bindings:          bindings,
 		BindAddress:       bindAddr,
 		AdvertisedAddress: advAddr,
 	}
 
-	log.Info("daemon starting")
-	log.Info("network identity resolved",
+	fw.Info("daemon starting",
 		"bind_address", bindAddr,
 		"bind_source", bindSource,
 		"advertised_address", advAddr,
@@ -399,17 +401,17 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 	if opts.OnStartTimeout > 0 {
 		startCtx, cancelStart = context.WithTimeout(ctx, opts.OnStartTimeout)
 	}
-	enrichedStart := enrichCtx(startCtx, cfgProv, secProv, log)
+	enrichedStart := enrichCtx(startCtx, cfgProv, secProv, base)
 	if err := d.OnStart(enrichedStart, sc); err != nil {
 		if cancelStart != nil {
 			cancelStart()
 		}
-		log.Error("OnStart returned error", "error", err)
+		fw.Error("OnStart returned error", "error", err)
 		flag.Store(true)
 		shutdownCtx, cancel := buildShutdownCtx(opts.OnStopTimeout)
 		defer cancel()
-		enriched := enrichCtx(shutdownCtx, cfgProv, secProv, log)
-		_ = runShutdown(enriched, log, nil, nil, d, cleaner)
+		enriched := enrichCtx(shutdownCtx, cfgProv, secProv, base)
+		_ = runShutdown(enriched, fw, nil, nil, d, cleaner)
 		return ExitFailure
 	}
 	order, err := orderedFromBindings(bindings)
@@ -417,16 +419,16 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 		if cancelStart != nil {
 			cancelStart()
 		}
-		log.Error("Bindings iteration failed", "error", err)
+		fw.Error("Bindings iteration failed", "error", err)
 		flag.Store(true)
 		shutdownCtx, cancel := buildShutdownCtx(opts.OnStopTimeout)
 		defer cancel()
-		enriched := enrichCtx(shutdownCtx, cfgProv, secProv, log)
-		_ = runShutdown(enriched, log, nil, nil, d, cleaner)
+		enriched := enrichCtx(shutdownCtx, cfgProv, secProv, base)
+		_ = runShutdown(enriched, fw, nil, nil, d, cleaner)
 		return ExitFailure
 	}
 
-	opened, openErr := openBindings(enrichedStart, log, order, flag, clk)
+	opened, openErr := openBindings(enrichedStart, fw, order, flag, clk)
 	if openErr != nil {
 		if cancelStart != nil {
 			cancelStart()
@@ -434,17 +436,17 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 		flag.Store(true)
 		shutdownCtx, cancel := buildShutdownCtx(opts.OnStopTimeout)
 		defer cancel()
-		enriched := enrichCtx(shutdownCtx, cfgProv, secProv, log)
-		_ = runShutdown(enriched, log, nil, opened, d, cleaner)
+		enriched := enrichCtx(shutdownCtx, cfgProv, secProv, base)
+		_ = runShutdown(enriched, fw, nil, opened, d, cleaner)
 		return ExitFailure
 	}
 
-	runCallbacks(enrichedStart, log, "on_listen_ready", &sc.onListenReady)
+	runCallbacks(enrichedStart, fw, "on_listen_ready", &sc.onListenReady)
 	if cancelStart != nil {
 		cancelStart()
 	}
 
-	log.Info("daemon ready")
+	fw.Info("daemon ready")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
@@ -452,19 +454,19 @@ func Serve(ctx context.Context, args []string, d Daemon, opts Options) int {
 
 	select {
 	case sig := <-sigCh:
-		log.Info("shutdown initiated",
+		fw.Info("shutdown initiated",
 			"reason", reasonSignal,
 			"signal", sig.String())
 	case <-ctx.Done():
-		log.Info("shutdown initiated", "reason", reasonContext)
+		fw.Info("shutdown initiated", "reason", reasonContext)
 	}
 
 	flag.Store(true)
 	shutdownCtx, cancel := buildShutdownCtx(opts.OnStopTimeout)
 	defer cancel()
-	enriched := enrichCtx(shutdownCtx, cfgProv, secProv, log)
-	_ = runShutdown(enriched, log, &sc.beforeShutdown, opened, d, cleaner)
-	log.Info("daemon stopped")
+	enriched := enrichCtx(shutdownCtx, cfgProv, secProv, base)
+	_ = runShutdown(enriched, fw, &sc.beforeShutdown, opened, d, cleaner)
+	fw.Info("daemon stopped")
 	return ExitSuccess
 }
 
