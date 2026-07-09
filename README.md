@@ -192,6 +192,31 @@ api.SetMux(fallbackMux) // handles requests no RPC handler claimed
 Each `RPCHandler` returns `true` to claim the request or `false` to pass it
 down the chain. The mux is the final fallback.
 
+### Terminal error replies
+
+When no `RPCHandler` claims a request and the mux (if any) has no matching
+route, scaffold answers with a DUH-shaped JSON Reply rather than an empty body
+or `net/http.ServeMux`'s plain-text `404 page not found`:
+
+```json
+{"code":"404","message":"no route matches GET /unknown"}
+```
+
+The same JSON shape is written for the `500` that `PanicRecovery` produces when
+a handler panics. Both are the terminal responses scaffold emits on its own
+behalf, so RPC clients always get a machine-readable body to recover from.
+
+Override either with `SetErrorHandler`, keyed by a fixed `ErrorStatus` (only
+the codes scaffold itself emits can be registered):
+
+```go
+api.SetErrorHandler(scaffold.ErrorStatus404, didYouMeanHandler) // unmatched route
+api.SetErrorHandler(scaffold.ErrorStatus500, internalErrHandler) // recovered panic
+```
+
+The `ErrorStatus500` handler is used only when `PanicRecovery` is in the
+binding's middleware chain.
+
 ### ServeFunc
 
 For non-HTTP protocols (gRPC with its own server, custom TCP), use
