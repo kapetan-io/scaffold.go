@@ -27,8 +27,8 @@ func TestPanicRecoveryConvertsPanicTo500(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
-	assert.Equal(t, "internal server error", rec.Body.String())
-	assert.Equal(t, "text/plain; charset=utf-8", rec.Header().Get("Content-Type"))
+	assert.JSONEq(t, `{"code":"500","message":"internal server error"}`, rec.Body.String())
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
 }
 
 func TestPanicRecoveryLogsPinnedFields(t *testing.T) {

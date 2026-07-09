@@ -37,6 +37,7 @@ type Binding struct {
 	mws         []MiddlewareFunc
 	rpcHandlers []RPCHandler
 	mux         http.Handler
+	errHandlers map[ErrorStatus]http.Handler
 	tls         *tls.Config
 	readTO      time.Duration
 	writeTO     time.Duration
@@ -89,6 +90,35 @@ func (b *Binding) SetMux(h http.Handler) {
 	b.mux = h
 }
 
+// SetErrorHandler registers h as the response for a terminal error scaffold
+// emits itself: ErrorStatus404 (no RPCHandler claimed the request and the mux
+// had no matching route) or ErrorStatus500 (a panic recovered by
+// PanicRecovery). h replaces scaffold's built-in JSON default for that status.
+//
+// Panics if status is not a known ErrorStatus, if h is nil, if a handler has
+// already been registered for status (duplicate registration is a programmer
+// error), or if ServeFunc has already been set.
+func (b *Binding) SetErrorHandler(status ErrorStatus, h http.Handler) {
+	if b.serveFunc != nil {
+		panic(fmt.Sprintf("scaffold: binding %q: SetErrorHandler is mutually exclusive with ServeFunc", b.name))
+	}
+	if h == nil {
+		panic(fmt.Sprintf("scaffold: binding %q: SetErrorHandler called with nil handler", b.name))
+	}
+	switch status {
+	case ErrorStatus404, ErrorStatus500:
+	default:
+		panic(fmt.Sprintf("scaffold: binding %q: SetErrorHandler unknown ErrorStatus %d", b.name, int(status)))
+	}
+	if b.errHandlers == nil {
+		b.errHandlers = make(map[ErrorStatus]http.Handler)
+	}
+	if _, dup := b.errHandlers[status]; dup {
+		panic(fmt.Sprintf("scaffold: binding %q: SetErrorHandler already called for ErrorStatus %d", b.name, int(status)))
+	}
+	b.errHandlers[status] = h
+}
+
 // SetTLS installs a *tls.Config on the binding. The binding's serve loop
 // will call srv.ServeTLS once the listener is open. Scaffold does not
 // pre-validate the config; misconfiguration surfaces at handshake time.
@@ -132,6 +162,9 @@ func (b *Binding) ServeFunc(fn func(net.Listener) error) {
 	if b.mux != nil {
 		panic(fmt.Sprintf("scaffold: binding %q: ServeFunc is mutually exclusive with SetMux", b.name))
 	}
+	if len(b.errHandlers) > 0 {
+		panic(fmt.Sprintf("scaffold: binding %q: ServeFunc is mutually exclusive with SetErrorHandler", b.name))
+	}
 	if b.tls != nil {
 		panic(fmt.Sprintf("scaffold: binding %q: ServeFunc is mutually exclusive with SetTLS", b.name))
 	}
@@ -150,12 +183,19 @@ func (b *Binding) Addr() net.Addr {
 }
 
 // buildHandler composes the final http.Handler for this binding: the RPC
-// chain runs in registration order, falls through to the mux (or a 404
-// default) when no handler short-circuits, and is wrapped in middleware
-// so the first-registered middleware is outermost.
+// chain runs in registration order, falls through to the mux (or the
+// ErrorStatus404 handler) when no handler short-circuits, and is wrapped in
+// middleware so the first-registered middleware is outermost.
+//
+// When a mux is set, an unmatched request must still yield the ErrorStatus404
+// reply rather than the mux's own default (net/http.ServeMux answers with
+// plain-text "404 page not found"). For a *http.ServeMux the binding detects a
+// non-match via Handler, whose pattern is empty when no route applies; other
+// http.Handler muxes cannot be introspected and own their fallback response.
 func (b *Binding) buildHandler() http.Handler {
 	rpcHandlers := b.rpcHandlers
 	mux := b.mux
+	notFound := b.resolveErrorHandler(ErrorStatus404)
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for _, h := range rpcHandlers {
 			if h.ServeHTTP(w, r) {
@@ -163,15 +203,41 @@ func (b *Binding) buildHandler() http.Handler {
 			}
 		}
 		if mux != nil {
+			if sm, ok := mux.(*http.ServeMux); ok {
+				if _, pattern := sm.Handler(r); pattern == "" {
+					notFound.ServeHTTP(w, r)
+					return
+				}
+			}
 			mux.ServeHTTP(w, r)
 			return
 		}
-		w.WriteHeader(http.StatusNotFound)
+		notFound.ServeHTTP(w, r)
 	})
 
 	var handler http.Handler = inner
 	for i := len(b.mws) - 1; i >= 0; i-- {
 		handler = b.mws[i](handler)
 	}
+	// Expose the registered error handlers to middleware (notably
+	// PanicRecovery, which resolves ErrorStatus500 when a panic unwinds). Set
+	// at the outermost layer so the map is visible no matter where the panic
+	// originates in the chain.
+	if len(b.errHandlers) > 0 {
+		errHandlers := b.errHandlers
+		next := handler
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(withErrorHandlers(r.Context(), errHandlers)))
+		})
+	}
 	return handler
+}
+
+// resolveErrorHandler returns the handler registered for status, or scaffold's
+// built-in default when none is registered.
+func (b *Binding) resolveErrorHandler(status ErrorStatus) http.Handler {
+	if h, ok := b.errHandlers[status]; ok {
+		return h
+	}
+	return defaultErrorHandler(status)
 }

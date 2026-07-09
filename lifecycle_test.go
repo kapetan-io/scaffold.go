@@ -276,8 +276,9 @@ func TestStartPanicRecoveryInHandler(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 	body, _ := io.ReadAll(resp.Body)
-	assert.Equal(t, "internal server error", string(body))
+	assert.JSONEq(t, `{"code":"500","message":"internal server error"}`, string(body))
 }
 
 func TestStartRPCChainFallthroughThenSetMuxThen404(t *testing.T) {

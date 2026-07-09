@@ -12,10 +12,12 @@ type MiddlewareFunc func(next http.Handler) http.Handler
 
 // PanicRecovery returns a middleware that recovers panics raised by the
 // wrapped handler. On panic it logs the recovered value and stack at error
-// level through log, then writes 500 Internal Server Error with body
-// "internal server error" and Content-Type "text/plain; charset=utf-8". The
-// log record's message and field names, and the response body, are pinned
-// operator and user-facing contracts.
+// level through log, then writes the binding's ErrorStatus500 response: the
+// handler registered via Binding.SetErrorHandler(ErrorStatus500, ...), or
+// scaffold's built-in DUH-shaped JSON default ({"code":"500","message":
+// "internal server error"}, Content-Type application/json) when none is
+// registered. The log record's message and field names are pinned operator
+// contracts.
 //
 // If the response has already been written by the wrapped handler, the
 // middleware emits the log record but does not attempt to overwrite the
@@ -42,9 +44,11 @@ func PanicRecovery(log *slog.Logger) MiddlewareFunc {
 				if pw.written {
 					return
 				}
-				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte("internal server error"))
+				if h := registeredErrorHandler(r.Context(), ErrorStatus500); h != nil {
+					h.ServeHTTP(w, r)
+					return
+				}
+				defaultErrorHandler(ErrorStatus500).ServeHTTP(w, r)
 			}()
 			next.ServeHTTP(pw, r)
 		})
